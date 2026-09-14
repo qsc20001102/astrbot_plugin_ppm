@@ -1,0 +1,27 @@
+{
+  "ai_provider_id": {
+    "description": "日报总结模型",
+    "type": "string",
+    "default": "",
+    "hint": "选择 AstrBot 中已经接入的聊天模型；留空时 AI 日报按钮将提示先配置。",
+    "_special": "select_provider"
+  },
+  "ai_summary_prompt": {
+    "description": "日报总结提示词",
+    "type": "text",
+    "default": "你是一名严谨的项目经理。请根据提供的多个项目资料，用中文输出一份合并团队日报，按项目归纳今日完成，并汇总风险与阻塞、明日建议。不要虚构未提供的信息。",
+    "hint": "选中项目的资料会自动追加在提示词之后。"
+  },
+  "company_name": {
+    "description": "公司或团队名称",
+    "type": "string",
+    "default": "我的团队"
+  },
+  "week_start": {
+    "description": "每周起始日",
+    "type": "string",
+    "default": "monday",
+    "options": ["monday", "sunday"],
+    "labels": ["周一", "周日"]
+  }
+}

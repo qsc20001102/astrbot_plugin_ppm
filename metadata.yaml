@@ -1,0 +1,8 @@
+name: astrbot_plugin_ppm
+display_name: PPM 项目进度管理
+desc: 面向团队的项目、成员、考勤、每日进展与 AI 日报管理插件。
+short_desc: 在 AstrBot WebUI 中管理项目进度、团队考勤与 AI 日报。
+version: v0.1.0
+author: PPM Contributors
+repo: ""
+astrbot_version: ">=4.16,<5"

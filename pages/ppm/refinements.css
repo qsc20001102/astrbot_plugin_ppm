@@ -1,0 +1,41 @@
+.drawer {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: min(860px, 92vw);
+  height: auto;
+  max-height: 88vh;
+  border-radius: 12px;
+  box-shadow: 0 22px 70px rgba(23, 32, 51, .22);
+}
+.drawer-body { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+.drawer-body > .detail-section:first-child { grid-column: 1 / -1; }
+.status-checkboxes label { display: inline-flex; align-items: center; gap: 5px; color: #526078; font-size: 12px; }
+.status-checkboxes input[type="checkbox"] { accent-color: var(--blue); }
+.attendance-cell.assigned { background: var(--blue-soft); color: var(--blue); font-weight: 700; }
+.attendance-cell.overtime { background: #fff0c7; color: #a66300; }
+.attendance-cell.timeoff { background: #ffe1e3; color: #c72f38; }
+.attendance-cell.future { background: transparent; color: transparent; cursor: default; }
+.timeline-cell { width: 100%; border: 0; font: inherit; }
+.project-detail-body { display: block; }
+.history-item { padding-right: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.history-item > div:first-child { min-width: 0; }
+.history-item > .actions { flex: 0 0 auto; }
+.compact-head { padding: 0 0 12px; border: 0; }
+.compact-head h3 { margin: 0; }
+#day-log-list .history-item { padding-top: 12px; padding-bottom: 12px; border-left: 0; border-bottom: 1px solid var(--border); }
+#day-log-list .history-item::before { display: none; }
+#day-log-list .history-item strong { font-weight: 500; line-height: 1.55; }
+.confirm-layer { z-index: 40; }
+.confirm-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 41; width: min(400px, 90vw); padding: 22px; background: var(--surface); border-radius: 12px; box-shadow: 0 22px 70px rgba(23, 32, 51, .24); }
+.confirm-modal h2 { margin: 0 0 10px; font-size: 18px; }
+.confirm-modal p { margin: 0; color: var(--muted); line-height: 1.6; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+.danger-button { cursor: pointer; border: 1px solid var(--red); border-radius: 8px; padding: 9px 15px; background: var(--red); color: #fff; font-weight: 650; }
+.danger-button:hover { background: #c9363b; }
+.summary-result { margin-top: 16px; }
+@media (max-width: 900px) {
+  .project-toolbar, .project-toolbar > .toolbar-group { align-items: flex-start; }
+  .drawer-body { grid-template-columns: 1fr; }
+  .drawer-body > .detail-section:first-child { grid-column: auto; }
+}
