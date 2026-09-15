@@ -14,7 +14,8 @@ from .ppm.web_api import WebApi
 PLUGIN_NAME = "astrbot_plugin_ppm"
 PROJECT_OVERVIEW_COMMAND = "项目总览"
 PROJECT_PROGRESS_COMMAND = "项目进程"
-PROJECT_SUMMARY_COMMAND = "项目总结"
+PROJECT_SUMMARY_COMMAND = "每日总结"
+PROJECT_LIFECYCLE_COMMAND = "项目总结"
 
 
 def _command_body(message: str, command: str) -> str:
@@ -50,16 +51,13 @@ def _parse_project_summary_args(message: str) -> tuple[int, list[str]]:
     """Parse history days followed by optional project IDs."""
     args = _command_body(message, PROJECT_SUMMARY_COMMAND).split()
     if not args:
-        raise ValidationError(
-            "项目总结参数错误：需要携带前面的总结天数。\n"
-            "正确写法：/项目总结 <天数> [项目ID] [项目ID] ..."
-        )
+        return 1, []
     try:
         history_days = int(args[0])
     except ValueError as exc:
         raise ValidationError(
             "携带的总结天数必须是整数。\n"
-            "正确写法：/项目总结 <天数> [项目ID] [项目ID] ..."
+            "正确写法：/每日总结 <天数> [项目ID] [项目ID] ..."
         ) from exc
     if history_days < 0 or history_days > 30:
         raise ValidationError("携带的总结天数必须在 0 到 30 之间")
@@ -128,21 +126,38 @@ class PPMPlugin(Star):
             history_days, requested_ids = _parse_project_summary_args(
                 event.message_str
             )
+            summary_date = _today_iso()
             project_ids = (
-                requested_ids or self.database.list_default_summary_project_ids()
+                requested_ids or self.database.list_default_summary_project_ids(summary_date)
             )
             if not project_ids:
                 raise ValidationError("没有可生成日报的项目")
             result = await self.web_api.generate_summary(
                 project_ids,
-                _today_iso(),
+                summary_date,
                 history_days,
                 overwrite=True,
             )
             reply = result["content"]
         except (ValidationError, NotFoundError) as exc:
-            reply = f"项目总结生成失败：{exc}"
+            reply = f"每日总结生成失败：{exc}"
         except Exception as exc:  # noqa: BLE001 - command handler must return a user-facing error
+            logger.exception("每日总结指令执行失败")
+            reply = f"每日总结生成失败：{exc}"
+        yield event.plain_result(reply)
+        event.stop_event()
+
+    @filter.command(PROJECT_LIFECYCLE_COMMAND)
+    async def project_lifecycle_summary(self, event: AstrMessageEvent):
+        """Summarize all recorded stages of one project."""
+        try:
+            args = _command_body(event.message_str, PROJECT_LIFECYCLE_COMMAND).split()
+            if len(args) != 1 or not re.fullmatch(r"[0-9]+", args[0]):
+                raise ValidationError("正确写法：/项目总结 <项目ID>，仅接受一个纯数字项目ID")
+            reply = await self.web_api.generate_project_summary(args[0])
+        except (ValidationError, NotFoundError) as exc:
+            reply = f"项目总结生成失败：{exc}"
+        except Exception as exc:  # noqa: BLE001 - command errors must be visible
             logger.exception("项目总结指令执行失败")
             reply = f"项目总结生成失败：{exc}"
         yield event.plain_result(reply)

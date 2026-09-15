@@ -28,6 +28,7 @@ class WebApi:
             ("members/save", self.save_member, ["POST"], "Create or update member"),
             ("members/delete", self.delete_member, ["POST"], "Delete member"),
             ("projects", self.projects, ["GET"], "List projects"),
+            ("ai/project-summary", self.ai_project_summary, ["POST"], "Generate project lifecycle summary"),
             ("projects/save", self.save_project, ["POST"], "Create or update project"),
             ("projects/delete", self.delete_project, ["POST"], "Delete project"),
             (
@@ -152,6 +153,9 @@ class WebApi:
         )
 
     async def projects(self):
+        summary_date = request.query.get("summary_date")
+        if summary_date is not None:
+            return await self._run(lambda: self.db.summary_projects(summary_date))
         return await self._run(lambda: self.db.list_projects())
 
     async def save_project(self):
@@ -260,7 +264,7 @@ class WebApi:
         self,
         project_ids: Any,
         summary_date: Any,
-        history_days: Any = 3,
+        history_days: Any = 1,
         *,
         overwrite: bool = False,
     ) -> dict[str, Any]:
@@ -273,13 +277,7 @@ class WebApi:
             project_ids, summary_date, history_days
         )
         prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n以下是项目资料：\n{material}"
-        response = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=prompt,
-        )
-        content = str(response.completion_text).strip()
-        if not content:
-            raise RuntimeError("模型返回了空内容")
+        content = await self._generate_text(provider_id, prompt)
         persisted = self.db.save_team_summary(
             project_ids,
             summary_date,
@@ -294,6 +292,35 @@ class WebApi:
             "persisted": persisted,
         }
 
+    async def generate_project_summary(self, project_id: Any) -> str:
+        material = self.db.project_lifecycle_material(project_id)
+        provider_id = str(self.config.get("ai_provider_id", "")).strip()
+        if not provider_id:
+            raise ValidationError("请先在插件配置中选择日报总结模型")
+        prompt = f"{self.config.get('ai_project_summary_prompt', '')}\n\n以下是项目全生命周期资料：\n{material}"
+        return await self._generate_text(provider_id, prompt)
+
+    async def _generate_text(self, provider_id: str, prompt: str) -> str:
+        response = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+        )
+        content = str(response.completion_text).strip()
+        if not content:
+            raise RuntimeError("模型返回了空内容")
+        return content
+
+    async def ai_project_summary(self):
+        payload = await request.json(default={})
+        try:
+            content = await self.generate_project_summary(payload.get("project_id"))
+            return json_response({"content": content})
+        except (ValidationError, NotFoundError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures for WebUI
+            logger.exception("PPM project lifecycle summary generation failed")
+            return error_response(f"项目总结生成失败：{exc}", status_code=502)
+
     async def ai_summary(self):
         payload = await request.json(default={})
         try:
@@ -303,7 +330,7 @@ class WebApi:
             result = await self.generate_summary(
                 payload.get("project_ids"),
                 payload.get("date") or _today().isoformat(),
-                payload.get("history_days", 3),
+                payload.get("history_days", 1),
                 overwrite=overwrite,
             )
             return json_response(result)

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -36,6 +37,48 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(detail["status_history"]), 2)
         self.assertEqual(detail["status_history"][0]["note"], "评审通过")
         self.assertIsNotNone(detail["membership_history"][0]["left_at"])
+
+    def test_editing_does_not_reorder_projects_members_or_histories(self):
+        first_member = self.db.save_member({"name": "Z"})
+        second_member = self.db.save_member({"name": "A"})
+        first = self.db.save_project({"name": "首个项目", "member_ids": [first_member["id"], second_member["id"]]})
+        second = self.db.save_project({"name": "第二项目", "member_ids": [first_member["id"]]})
+        self.db.insert_status_history({"project_id": first["id"], "to_status": "维护",
+                                       "changed_at": "2020-01-01T00:00:00"})
+        before = self.db.project_detail(first["id"])
+        ids = lambda rows: [row["id"] for row in rows]
+        recent_ids = ids(self.db.dashboard()["recent_projects"])
+        member_project_ids = ids(self.db.list_members()[0]["projects"])
+        self.db.save_member({"id": first_member["id"], "name": "0"})
+        self.db.save_project({"id": first["id"], "name": "改名项目", "status": before["status"],
+                              "member_ids": [first_member["id"], second_member["id"]]})
+        history = before["status_history"][0]
+        self.db.update_status_history({"id": history["id"], "project_id": first["id"],
+                                       "to_status": "维护", "changed_at": "2099-01-01T00:00:00"})
+        self.assertEqual(ids(self.db.list_projects()), [first["id"], second["id"]])
+        self.assertEqual(ids(self.db.list_members()), [first_member["id"], second_member["id"]])
+        self.assertEqual(ids(self.db.dashboard()["recent_projects"]), recent_ids)
+        self.assertEqual(ids(self.db.list_members()[0]["projects"]), member_project_ids)
+        self.assertEqual(ids(self.db.project_detail(first["id"])["status_history"]),
+                         ids(before["status_history"]))
+        self.assertEqual(self.db.project_detail(first["id"])["status"], "维护")
+
+    def test_lifecycle_material_contains_all_logs_and_chronological_stages(self):
+        project = self.db.save_project({"name": "全周期项目", "status": "维护"})
+        other = self.db.save_project({"name": "其他项目"})
+        self.db.insert_status_history({"project_id": project["id"], "to_status": "进行",
+                                       "changed_at": "2020-01-01T00:00:00"})
+        for index in range(65):
+            self.db.save_work_log({"project_id": project["id"], "work_date": "2020-01-02",
+                                   "content": f"工作记录{index}"})
+        self.db.save_work_log({"project_id": other["id"], "work_date": "2020-01-02", "content": "不应混入"})
+        material = json.loads(self.db.project_lifecycle_material(project["id"]))
+        self.assertEqual(len(material["work_logs"]), 65)
+        self.assertEqual(material["work_logs"][0]["content"], "工作记录0")
+        self.assertEqual(material["work_logs"][-1]["content"], "工作记录64")
+        self.assertEqual(material["work_logs"][0]["status_on_date"], "进行")
+        self.assertEqual(material["status_history"][0]["to_status"], "进行")
+        self.assertEqual(material["project"]["id"], project["id"])
 
     def test_project_id_is_numeric_and_immutable(self):
         project = self.db.save_project({"name": "编号项目"})
@@ -110,17 +153,45 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "正确写法：/项目总览"):
             self.db.list_project_overview(["执行中"])
 
-    def test_default_summary_projects_match_advancing_statuses(self):
-        ready = self.db.save_project({"name": "准备总结", "status": "准备"})
-        active = self.db.save_project({"name": "进行总结", "status": "进行"})
-        maintenance = self.db.save_project({"name": "维护总结", "status": "维护"})
-        self.db.save_project({"name": "暂停总结", "status": "暂停"})
-        self.db.save_project({"name": "结束总结", "status": "结束"})
+    def test_default_summary_projects_require_records_regardless_of_status(self):
+        day = datetime.now().astimezone().date().isoformat()
+        expected = []
+        for status in ("准备", "进行", "维护", "暂停", "结束"):
+            project = self.db.save_project({"name": status, "status": status})
+            self.db.save_project({"name": status + "无记录", "status": status})
+            self.db.save_work_log({"project_id": project["id"], "work_date": day, "content": "当日工作"})
+            expected.append(project["id"])
+        self.assertEqual(self.db.list_default_summary_project_ids(day), expected)
+        self.assertEqual(self.db.team_summary_material([], day)[0], expected)
 
-        self.assertEqual(
-            self.db.list_default_summary_project_ids(),
-            [ready["id"], active["id"], maintenance["id"]],
-        )
+    def test_summary_uses_selected_date_status_and_excludes_uncreated_projects(self):
+        project = self.db.save_project({"name": "历史总结", "status": "结束"})
+        with self.db._connection() as conn:
+            conn.execute("DELETE FROM project_status_history WHERE project_id=?", (project["id"],))
+        for day, status in [("2026-01-02", "准备"), ("2026-01-03", "进行"),
+                            ("2026-01-04", "暂停"), ("2026-01-05", "维护"),
+                            ("2026-01-06", "结束")]:
+            self.db.insert_status_history({"project_id": project["id"],
+                                           "to_status": status, "changed_at": day + "T12:00:00"})
+        self.assertEqual(self.db.summary_projects("2026-01-01"), [])
+        for day, status, selected in [("2026-01-03", "进行", True),
+                                      ("2026-01-04", "暂停", False),
+                                      ("2026-01-05", "维护", True),
+                                      ("2026-01-06", "结束", False)]:
+            with self.subTest(day=day):
+                if selected:
+                    self.db.save_work_log({"project_id": project["id"], "work_date": day, "content": "历史工作"})
+                self.assertEqual(self.db.summary_projects(day)[0]["status"], status)
+                self.assertEqual(self.db.list_default_summary_project_ids(day),
+                                 [project["id"]] if selected else [])
+                _, material = self.db.team_summary_material([project["id"]], day, 0)
+                self.assertIn(f"状态：{status}", material)
+        ids, _ = self.db.team_summary_material([], "2026-01-03", 0)
+        self.assertEqual(ids, [project["id"]])
+        with self.assertRaises(ValidationError):
+            self.db.team_summary_material([], "2026-01-04", 0)
+        with self.assertRaises(ValidationError):
+            self.db.team_summary_material([project["id"]], "2026-01-01", 0)
 
     def test_attendance_defaults_to_normal_and_override_is_counted(self):
         member = self.db.save_member({"name": "王五"})
@@ -194,8 +265,26 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(
             set(assignments[f"{member['id']}:{day}"]),
-            {"准备项目", "进行项目", "维护项目"},
+            {"进行项目"},
         )
+
+    def test_maintenance_attendance_requires_project_log_on_that_date(self):
+        members = [self.db.save_member({"name": name}) for name in ("甲", "乙")]
+        project = self.db.save_project({"name": "维护项目", "status": "维护",
+                                        "member_ids": [m["id"] for m in members]})
+        day = datetime.now().astimezone().date().isoformat()
+        other = self.db.save_project({"name": "其他项目", "status": "维护"})
+        self.db.save_work_log({"project_id": other["id"], "work_date": day, "content": "其他项目记录"})
+        self.db.save_work_log({"project_id": project["id"],
+                               "work_date": (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat(),
+                               "content": "昨日记录"})
+        self.assertEqual(self.db.attendance_matrix(day[:7])["assignments"], {})
+        log = self.db.save_work_log({"project_id": project["id"], "work_date": day, "content": "今日维护"})
+        assignments = self.db.attendance_matrix(day[:7])["assignments"]
+        for member in members:
+            self.assertEqual(assignments[f"{member['id']}:{day}"], ["维护项目"])
+        self.db.delete_work_log(log["id"])
+        self.assertEqual(self.db.attendance_matrix(day[:7])["assignments"], {})
 
     def test_attendance_uses_project_status_effective_on_each_date(self):
         member = self.db.save_member({"name": "状态成员"})

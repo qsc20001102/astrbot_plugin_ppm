@@ -22,7 +22,6 @@ from .validation import (
 PROJECT_STATUS_ORDER = ("准备", "进行", "维护", "暂停", "结束")
 PROJECT_STATUSES = set(PROJECT_STATUS_ORDER)
 DEFAULT_PROJECT_OVERVIEW_STATUSES = PROJECT_STATUS_ORDER[:-1]
-ADVANCING_PROJECT_STATUSES = {"准备", "进行", "维护"}
 ATTENDANCE_STATUSES = {"正常", "加班", "调休"}
 
 
@@ -84,7 +83,7 @@ class Database:
                 (SELECT work_date FROM work_logs w WHERE w.project_id=p.id
                   ORDER BY work_date DESC,id DESC LIMIT 1) latest_record_date
                 FROM projects p WHERE p.deleted_at IS NULL
-                ORDER BY p.updated_at DESC LIMIT 6"""
+                ORDER BY p.id DESC LIMIT 6"""
                 )
             )
         month_start = _today().replace(day=1).isoformat()
@@ -109,7 +108,7 @@ class Database:
                 FROM members m
                 LEFT JOIN project_memberships pm ON pm.member_id=m.id
                 LEFT JOIN projects p ON p.id=pm.project_id AND p.deleted_at IS NULL
-                WHERE m.deleted_at IS NULL GROUP BY m.id ORDER BY m.name"""
+                WHERE m.deleted_at IS NULL GROUP BY m.id ORDER BY m.id"""
                 )
             )
             for row in rows:
@@ -117,7 +116,7 @@ class Database:
                     conn.execute(
                         """SELECT p.id,p.name,p.status,pm.joined_at,pm.left_at FROM project_memberships pm
                     JOIN projects p ON p.id=pm.project_id WHERE pm.member_id=? AND p.deleted_at IS NULL
-                    ORDER BY pm.left_at IS NULL DESC,p.updated_at DESC""",
+                    ORDER BY p.id,pm.id""",
                         (row["id"],),
                     )
                 )
@@ -171,14 +170,14 @@ class Database:
                     """SELECT p.*,
                 (SELECT work_date FROM work_logs w WHERE w.project_id=p.id
                   ORDER BY work_date DESC,id DESC LIMIT 1) latest_record_date
-                FROM projects p WHERE deleted_at IS NULL ORDER BY updated_at DESC"""
+                FROM projects p WHERE deleted_at IS NULL ORDER BY p.id"""
                 )
             )
             for row in rows:
                 row["members"] = self._rows(
                     conn.execute(
                         """SELECT m.id,m.name,m.role FROM project_memberships pm JOIN members m ON m.id=pm.member_id
-                    WHERE pm.project_id=? AND pm.left_at IS NULL AND m.deleted_at IS NULL ORDER BY m.name""",
+                    WHERE pm.project_id=? AND pm.left_at IS NULL AND m.deleted_at IS NULL ORDER BY m.id,pm.id""",
                         (row["id"],),
                     )
                 )
@@ -213,11 +212,28 @@ class Database:
                 )
             )
 
-    def list_default_summary_project_ids(self) -> list[int]:
+    def summary_projects(self, summary_date: Any) -> list[dict[str, Any]]:
+        """Return project states at the end of the requested calendar day."""
+        summary_date = parse_date(summary_date, "summary_date")
+        with self._connection() as conn:
+            return self._rows(conn.execute(
+                """SELECT p.id,p.name,h.to_status AS status,
+                EXISTS(SELECT 1 FROM work_logs w WHERE w.project_id=p.id
+                       AND w.work_date=?) AS has_records
+                FROM projects p JOIN project_status_history h ON h.id=(
+                    SELECT id FROM project_status_history
+                    WHERE project_id=p.id AND substr(changed_at,1,10)<=?
+                    ORDER BY changed_at DESC,id DESC LIMIT 1
+                ) WHERE p.deleted_at IS NULL ORDER BY p.id""",
+                (summary_date, summary_date),
+            ))
+
+    def list_default_summary_project_ids(self, summary_date: Any = None) -> list[int]:
         """Return the projects selected by default in the summary UI."""
         return [
             project["id"]
-            for project in self.list_project_overview(ADVANCING_PROJECT_STATUSES)
+            for project in self.summary_projects(summary_date or _today().isoformat())
+            if project["has_records"]
         ]
 
     def save_project(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -323,6 +339,28 @@ class Database:
                 (_today().isoformat(), project_id),
             )
 
+    def project_lifecycle_material(self, project_id: Any) -> str:
+        project_id = parse_id(project_id)
+        with self._connection() as conn:
+            project = conn.execute(
+                "SELECT id,name,description,status,start_date,end_date,created_at FROM projects WHERE id=? AND deleted_at IS NULL",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise NotFoundError("项目不存在")
+            history = self._rows(conn.execute(
+                "SELECT from_status,to_status,changed_at,note FROM project_status_history WHERE project_id=? ORDER BY changed_at,id",
+                (project_id,),
+            ))
+            logs = self._rows(conn.execute(
+                "SELECT work_date,content FROM work_logs WHERE project_id=? ORDER BY work_date,id",
+                (project_id,),
+            ))
+        for log in logs:
+            log["status_on_date"] = self._status_on_date(history, log["work_date"])
+        return json.dumps({"project": dict(project), "status_history": history,
+                           "work_logs": logs}, ensure_ascii=False)
+
     def project_detail(self, project_id: Any) -> dict[str, Any]:
         project_id = parse_id(project_id)
         with self._connection() as conn:
@@ -335,21 +373,21 @@ class Database:
             result = dict(project)
             result["status_history"] = self._rows(
                 conn.execute(
-                    "SELECT * FROM project_status_history WHERE project_id=? ORDER BY changed_at DESC,id DESC",
+                    "SELECT * FROM project_status_history WHERE project_id=? ORDER BY id DESC",
                     (project_id,),
                 )
             )
             result["membership_history"] = self._rows(
                 conn.execute(
                     """SELECT pm.*,m.name FROM project_memberships pm JOIN members m ON m.id=pm.member_id
-                WHERE pm.project_id=? ORDER BY joined_at DESC,pm.id DESC""",
+                WHERE pm.project_id=? ORDER BY pm.id DESC""",
                     (project_id,),
                 )
             )
             result["work_logs"] = self._rows(
                 conn.execute(
                     """SELECT w.* FROM work_logs w
-                WHERE w.project_id=? ORDER BY work_date DESC,w.id DESC LIMIT 60""",
+                WHERE w.project_id=? ORDER BY w.id DESC LIMIT 60""",
                     (project_id,),
                 )
             )
@@ -485,6 +523,13 @@ class Database:
         members = self.list_members()
         start, end = month_bounds(month)
         with self._connection() as conn:
+            logged_days = {
+                (row["project_id"], row["work_date"])
+                for row in conn.execute(
+                    "SELECT DISTINCT project_id,work_date FROM work_logs WHERE work_date BETWEEN ? AND ?",
+                    (start.isoformat(), end.isoformat()),
+                )
+            }
             records = self._rows(
                 conn.execute(
                     "SELECT * FROM attendance_records WHERE work_date BETWEEN ? AND ?",
@@ -514,11 +559,17 @@ class Database:
         for item in memberships:
             for day in calendar["days"]:
                 day_value = day["date"]
+                status = self._status_on_date(
+                    histories_by_project.get(item["project_id"], []), day_value
+                )
                 if item["joined_at"] <= day_value and (
                     item["left_at"] is None or item["left_at"] >= day_value
-                ) and self._status_on_date(
-                    histories_by_project.get(item["project_id"], []), day_value
-                ) in ADVANCING_PROJECT_STATUSES:
+                ) and (
+                    status == "进行" or (
+                        status == "维护"
+                        and (item["project_id"], day_value) in logged_days
+                    )
+                ):
                     assignments.setdefault(
                         f"{item['member_id']}:{day_value}", []
                     ).append(item["name"])
@@ -570,7 +621,7 @@ class Database:
         with self._connection() as conn:
             members = self._rows(
                 conn.execute(
-                    "SELECT id,name FROM members WHERE deleted_at IS NULL ORDER BY name"
+                    "SELECT id,name FROM members WHERE deleted_at IS NULL ORDER BY id"
                 )
             )
             records = self._rows(
@@ -590,7 +641,7 @@ class Database:
                 conn.execute(
                     """SELECT a.work_date,a.status,a.hours,a.note,m.name FROM attendance_records a
                 JOIN members m ON m.id=a.member_id WHERE a.work_date BETWEEN ? AND ? AND a.status IN ('加班','调休')
-                ORDER BY a.work_date DESC,m.name""",
+                ORDER BY a.work_date DESC,m.id,a.id""",
                     (start, end),
                 )
             )
@@ -634,7 +685,7 @@ class Database:
         return {"summary": summary, "details": details, "start": start, "end": end}
 
     def team_summary_material(
-        self, project_ids: Any, summary_date: Any, history_days: Any = 3
+        self, project_ids: Any, summary_date: Any, history_days: Any = 1
     ) -> tuple[list[int], str]:
         summary_date = parse_date(summary_date, "summary_date")
         try:
@@ -648,23 +699,15 @@ class Database:
             if not project_ids
             else [parse_id(value, "project_id") for value in project_ids]
         )
+        dated_projects = self.summary_projects(summary_date)
+        projects = [
+            project for project in dated_projects
+            if (project["id"] in requested if requested
+                else project["has_records"])
+        ]
+        if requested and len(projects) != len(set(requested)):
+            raise ValidationError("包含不存在或所选日期尚未建立的项目")
         with self._connection() as conn:
-            if requested:
-                placeholders = ",".join("?" * len(requested))
-                projects = self._rows(
-                    conn.execute(
-                        f"SELECT id,name,status FROM projects WHERE deleted_at IS NULL AND id IN ({placeholders}) ORDER BY name",
-                        requested,
-                    )
-                )
-                if len(projects) != len(set(requested)):
-                    raise ValidationError("包含不存在的项目")
-            else:
-                projects = self._rows(
-                    conn.execute(
-                        "SELECT id,name,status FROM projects WHERE deleted_at IS NULL ORDER BY name"
-                    )
-                )
             sections = []
             for project in projects:
                 logs = self._rows(
