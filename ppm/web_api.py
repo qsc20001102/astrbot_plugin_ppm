@@ -9,6 +9,7 @@ from astrbot.api.web import error_response, json_response, request
 
 from .database import Database
 from .errors import NotFoundError, ValidationError
+from .validation import parse_date
 
 
 class WebApi:
@@ -100,6 +101,19 @@ class WebApi:
                 self.ai_summary,
                 ["POST"],
                 "Generate multi-project daily summary",
+            ),
+            ("summaries", self.summaries, ["GET"], "List daily summaries"),
+            (
+                "summaries/save",
+                self.save_summary_content,
+                ["POST"],
+                "Update saved daily summary content",
+            ),
+            (
+                "summaries/delete",
+                self.delete_summary,
+                ["POST"],
+                "Delete daily summary",
             ),
         ]
         for endpoint, handler, methods, description in routes:
@@ -242,33 +256,103 @@ class WebApi:
         end = request.query.get("end") or today.isoformat()
         return await self._run(lambda: self.db.attendance_summary(start, end))
 
-    async def ai_summary(self):
-        payload = await request.json(default={})
+    async def generate_summary(
+        self,
+        project_ids: Any,
+        summary_date: Any,
+        history_days: Any = 3,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Generate a summary and optionally persist it for the given date."""
         provider_id = str(self.config.get("ai_provider_id", "")).strip()
         if not provider_id:
-            return error_response("请先在插件配置中选择日报总结模型", status_code=400)
+            raise ValidationError("请先在插件配置中选择日报总结模型")
+        summary_date = parse_date(summary_date, "summary_date")
+        project_ids, material = self.db.team_summary_material(
+            project_ids, summary_date, history_days
+        )
+        prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n以下是项目资料：\n{material}"
+        response = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+        )
+        content = str(response.completion_text).strip()
+        if not content:
+            raise RuntimeError("模型返回了空内容")
+        persisted = self.db.save_team_summary(
+            project_ids,
+            summary_date,
+            provider_id,
+            content,
+            overwrite=overwrite,
+        )
+        return {
+            "content": content,
+            "date": summary_date,
+            "project_ids": project_ids,
+            "persisted": persisted,
+        }
+
+    async def ai_summary(self):
+        payload = await request.json(default={})
         try:
-            project_ids, material = self.db.team_summary_material(
-                payload.get("project_ids"), payload.get("date") or _today().isoformat()
+            overwrite = payload.get("overwrite", False)
+            if not isinstance(overwrite, bool):
+                raise ValidationError("overwrite 必须是布尔值")
+            result = await self.generate_summary(
+                payload.get("project_ids"),
+                payload.get("date") or _today().isoformat(),
+                payload.get("history_days", 3),
+                overwrite=overwrite,
             )
-            prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n以下是项目资料：\n{material}"
-            response = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-            )
-            content = str(response.completion_text).strip()
-            if not content:
-                raise RuntimeError("模型返回了空内容")
-            summary_date = payload.get("date") or _today().isoformat()
-            self.db.save_team_summary(project_ids, summary_date, provider_id, content)
-            return json_response(
-                {"content": content, "date": summary_date, "project_ids": project_ids}
-            )
+            return json_response(result)
         except (ValidationError, NotFoundError) as exc:
             return error_response(str(exc), status_code=400)
         except Exception as exc:  # noqa: BLE001 - normalize provider failures for WebUI
             logger.exception("PPM AI summary generation failed")
             return error_response(f"AI 日报生成失败：{exc}", status_code=502)
+
+    async def summaries(self):
+        today = _today()
+        return await self._run(
+            lambda: self.db.list_team_summaries(
+                request.query.get("start")
+                or (today - timedelta(days=6)).isoformat(),
+                request.query.get("end") or today.isoformat(),
+            )
+        )
+
+    async def save_summary_content(self):
+        payload = await request.json(default={})
+        return await self._run(lambda: self._save_summary(payload))
+
+    async def delete_summary(self):
+        payload = await request.json(default={})
+        return await self._run(
+            lambda: self._deleted(
+                self.db.delete_team_summary,
+                payload.get("date") or _today().isoformat(),
+            )
+        )
+
+    def _save_summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        summary_date = payload.get("date") or _today().isoformat()
+        if "project_ids" not in payload:
+            return self.db.update_team_summary_content(
+                summary_date, payload.get("content")
+            )
+        project_ids, _ = self.db.team_summary_material(
+            payload.get("project_ids"), summary_date, 0
+        )
+        self.db.save_team_summary(
+            project_ids,
+            summary_date,
+            str(self.config.get("ai_provider_id", "")).strip(),
+            payload.get("content"),
+            overwrite=True,
+        )
+        return self.db.get_team_summary(summary_date)
 
     @staticmethod
     def _deleted(operation: Callable[[Any], None], entity_id: Any) -> dict[str, bool]:

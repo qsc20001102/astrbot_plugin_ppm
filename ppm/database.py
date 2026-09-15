@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,10 @@ from .validation import (
     required_text,
 )
 
-PROJECT_STATUSES = {"准备", "进行", "维护", "暂停", "结束"}
+PROJECT_STATUS_ORDER = ("准备", "进行", "维护", "暂停", "结束")
+PROJECT_STATUSES = set(PROJECT_STATUS_ORDER)
+DEFAULT_PROJECT_OVERVIEW_STATUSES = PROJECT_STATUS_ORDER[:-1]
+ADVANCING_PROJECT_STATUSES = {"准备", "进行", "维护"}
 ATTENDANCE_STATUSES = {"正常", "加班", "调休"}
 
 
@@ -78,8 +81,8 @@ class Database:
             recent = self._rows(
                 conn.execute(
                     """SELECT p.id,p.name,p.status,p.updated_at,
-                COALESCE((SELECT content FROM work_logs w WHERE w.project_id=p.id
-                  ORDER BY work_date DESC,id DESC LIMIT 1),'暂无进展') latest
+                (SELECT work_date FROM work_logs w WHERE w.project_id=p.id
+                  ORDER BY work_date DESC,id DESC LIMIT 1) latest_record_date
                 FROM projects p WHERE p.deleted_at IS NULL
                 ORDER BY p.updated_at DESC LIMIT 6"""
                 )
@@ -166,7 +169,8 @@ class Database:
             rows = self._rows(
                 conn.execute(
                     """SELECT p.*,
-                (SELECT content FROM work_logs w WHERE w.project_id=p.id ORDER BY work_date DESC,id DESC LIMIT 1) latest_log
+                (SELECT work_date FROM work_logs w WHERE w.project_id=p.id
+                  ORDER BY work_date DESC,id DESC LIMIT 1) latest_record_date
                 FROM projects p WHERE deleted_at IS NULL ORDER BY updated_at DESC"""
                 )
             )
@@ -179,6 +183,42 @@ class Database:
                     )
                 )
             return rows
+
+    def list_project_overview(self, statuses: Any = None) -> list[dict[str, Any]]:
+        """Return project IDs, names and statuses for the message overview command."""
+        if isinstance(statuses, str):
+            statuses = [statuses]
+        requested = [str(status).strip() for status in (statuses or [])]
+        requested = list(dict.fromkeys(status for status in requested if status))
+        invalid = [status for status in requested if status not in PROJECT_STATUSES]
+        if invalid:
+            invalid_text = "、".join(dict.fromkeys(invalid))
+            available = "、".join(PROJECT_STATUS_ORDER)
+            raise ValidationError(
+                f"项目状态输入错误：{invalid_text}\n"
+                f"正确写法：/项目总览 [状态] [状态] ...\n"
+                f"可用状态：{available}\n"
+                "不填写状态时默认查询除结束外的项目。"
+            )
+        if not requested:
+            requested = list(DEFAULT_PROJECT_OVERVIEW_STATUSES)
+        placeholders = ",".join("?" * len(requested))
+        with self._connection() as conn:
+            return self._rows(
+                conn.execute(
+                    f"""SELECT id,name,status FROM projects
+                    WHERE deleted_at IS NULL AND status IN ({placeholders})
+                    ORDER BY id""",
+                    requested,
+                )
+            )
+
+    def list_default_summary_project_ids(self) -> list[int]:
+        """Return the projects selected by default in the summary UI."""
+        return [
+            project["id"]
+            for project in self.list_project_overview(ADVANCING_PROJECT_STATUSES)
+        ]
 
     def save_project(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = required_text(payload, "name", 120)
@@ -430,8 +470,6 @@ class Database:
 
     def save_calendar_day(self, payload: dict[str, Any]) -> None:
         work_date = parse_date(payload.get("date"))
-        if work_date > _today().isoformat():
-            raise ValidationError("不能登记未来日期的考勤")
         if not isinstance(payload.get("is_workday"), bool):
             raise ValidationError("is_workday 必须是布尔值")
         note = optional_text(payload, "note", 300)
@@ -455,12 +493,22 @@ class Database:
             )
             memberships = self._rows(
                 conn.execute(
-                    """SELECT pm.member_id,p.name,pm.joined_at,pm.left_at
+                    """SELECT pm.member_id,pm.project_id,p.name,pm.joined_at,pm.left_at
                     FROM project_memberships pm JOIN projects p ON p.id=pm.project_id
-                    WHERE p.deleted_at IS NULL AND pm.joined_at<=? AND (pm.left_at IS NULL OR pm.left_at>=?)""",
+                    WHERE p.deleted_at IS NULL AND pm.joined_at<=?
+                    AND (pm.left_at IS NULL OR pm.left_at>=?)""",
                     (end.isoformat(), start.isoformat()),
                 )
             )
+            histories = self._rows(
+                conn.execute(
+                    """SELECT project_id,to_status,changed_at FROM project_status_history
+                    ORDER BY changed_at ASC,id ASC"""
+                )
+            )
+        histories_by_project: dict[int, list[dict[str, Any]]] = {}
+        for history in histories:
+            histories_by_project.setdefault(history["project_id"], []).append(history)
         explicit = {f"{r['member_id']}:{r['work_date']}": r for r in records}
         assignments: dict[str, list[str]] = {}
         for item in memberships:
@@ -468,7 +516,9 @@ class Database:
                 day_value = day["date"]
                 if item["joined_at"] <= day_value and (
                     item["left_at"] is None or item["left_at"] >= day_value
-                ):
+                ) and self._status_on_date(
+                    histories_by_project.get(item["project_id"], []), day_value
+                ) in ADVANCING_PROJECT_STATUSES:
                     assignments.setdefault(
                         f"{item['member_id']}:{day_value}", []
                     ).append(item["name"])
@@ -479,6 +529,15 @@ class Database:
             "assignments": assignments,
             "today": _today().isoformat(),
         }
+
+    @staticmethod
+    def _status_on_date(history: list[dict[str, Any]], work_date: str) -> str | None:
+        status = None
+        for item in history:
+            if item["changed_at"][:10] > work_date:
+                break
+            status = item["to_status"]
+        return status
 
     def save_attendance(self, payload: dict[str, Any]) -> None:
         member_id = parse_id(payload.get("member_id"), "member_id")
@@ -575,9 +634,15 @@ class Database:
         return {"summary": summary, "details": details, "start": start, "end": end}
 
     def team_summary_material(
-        self, project_ids: Any, summary_date: Any
+        self, project_ids: Any, summary_date: Any, history_days: Any = 3
     ) -> tuple[list[int], str]:
         summary_date = parse_date(summary_date, "summary_date")
+        try:
+            history_days = int(history_days)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("history_days 必须是整数") from exc
+        if history_days < 0 or history_days > 30:
+            raise ValidationError("history_days 必须在 0 到 30 之间")
         requested = (
             []
             if not project_ids
@@ -612,21 +677,149 @@ class Database:
                     f"项目：{project['name']}\n状态：{project['status']}\n今日记录：\n"
                     + ("\n".join(f"- {log['content']}" for log in logs) or "- 无记录")
                 )
+            history = []
+            if history_days:
+                history_start = (
+                    date.fromisoformat(summary_date) - timedelta(days=history_days)
+                ).isoformat()
+                history = self._rows(
+                    conn.execute(
+                        """SELECT summary_date,content FROM team_daily_summaries
+                        WHERE summary_date BETWEEN ? AND ? ORDER BY summary_date""",
+                        (
+                            history_start,
+                            (date.fromisoformat(summary_date) - timedelta(days=1)).isoformat(),
+                        ),
+                    )
+                )
         if not projects:
             raise ValidationError("没有可生成日报的项目")
-        return [
-            project["id"] for project in projects
-        ], f"日期：{summary_date}\n\n" + "\n\n".join(sections)
+        material = f"日期：{summary_date}\n\n" + "\n\n".join(sections)
+        if history:
+            material += "\n\n前几天已生成的团队总结：\n" + "\n\n".join(
+                f"[{item['summary_date']}]\n{item['content']}" for item in history
+            )
+        return [project["id"] for project in projects], material
 
     def save_team_summary(
-        self, project_ids: list[int], summary_date: str, provider_id: str, content: str
-    ) -> None:
+        self,
+        project_ids: list[int],
+        summary_date: str,
+        provider_id: str,
+        content: str,
+        overwrite: bool = False,
+    ) -> bool:
+        summary_date = parse_date(summary_date, "summary_date")
+        content = str(content).strip()
+        if not content:
+            raise ValidationError("日报内容不能为空")
         with self._connection() as conn:
-            conn.execute(
-                """INSERT INTO team_daily_summaries(summary_date,project_ids,provider_id,content,created_at) VALUES(?,?,?,?,?)
-                ON CONFLICT(summary_date) DO UPDATE SET project_ids=excluded.project_ids,provider_id=excluded.provider_id,content=excluded.content,created_at=excluded.created_at""",
+            if overwrite:
+                conn.execute(
+                    """INSERT INTO team_daily_summaries(summary_date,project_ids,provider_id,content,created_at) VALUES(?,?,?,?,?)
+                    ON CONFLICT(summary_date) DO UPDATE SET project_ids=excluded.project_ids,provider_id=excluded.provider_id,content=excluded.content,created_at=excluded.created_at""",
+                    (summary_date, json.dumps(project_ids), provider_id, content, _now()),
+                )
+                return True
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO team_daily_summaries
+                (summary_date,project_ids,provider_id,content,created_at) VALUES(?,?,?,?,?)""",
                 (summary_date, json.dumps(project_ids), provider_id, content, _now()),
             )
+            return bool(cursor.rowcount)
+
+    def get_team_summary(self, summary_date: Any) -> dict[str, Any] | None:
+        summary_date = parse_date(summary_date, "summary_date")
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM team_daily_summaries WHERE summary_date=?",
+                (summary_date,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["project_ids"] = json.loads(result["project_ids"])
+            if result["project_ids"]:
+                placeholders = ",".join("?" * len(result["project_ids"]))
+                names = {
+                    item["id"]: item["name"]
+                    for item in conn.execute(
+                        f"SELECT id,name FROM projects WHERE id IN ({placeholders})",
+                        result["project_ids"],
+                    )
+                }
+                result["project_names"] = [
+                    names[item] for item in result["project_ids"] if item in names
+                ]
+            else:
+                result["project_names"] = []
+            return result
+
+    def list_team_summaries(self, start: Any, end: Any) -> dict[str, Any]:
+        start_date = date.fromisoformat(parse_date(start, "start"))
+        end_date = date.fromisoformat(parse_date(end, "end"))
+        if end_date < start_date:
+            raise ValidationError("end 不能早于 start")
+        if (end_date - start_date).days > 62:
+            raise ValidationError("项目总结最多查询 63 天")
+        dates = [day.isoformat() for day in date_range(start_date, end_date)]
+        with self._connection() as conn:
+            summaries = self._rows(
+                conn.execute(
+                    """SELECT * FROM team_daily_summaries
+                    WHERE summary_date BETWEEN ? AND ? ORDER BY summary_date""",
+                    (start_date.isoformat(), end_date.isoformat()),
+                )
+            )
+            project_ids = {
+                project_id
+                for summary in summaries
+                for project_id in json.loads(summary["project_ids"])
+            }
+            names = {}
+            if project_ids:
+                placeholders = ",".join("?" * len(project_ids))
+                names = {
+                    row["id"]: row["name"]
+                    for row in conn.execute(
+                        f"SELECT id,name FROM projects WHERE id IN ({placeholders})",
+                        sorted(project_ids),
+                    )
+                }
+        for summary in summaries:
+            summary["project_ids"] = json.loads(summary["project_ids"])
+            summary["project_names"] = [
+                names[project_id]
+                for project_id in summary["project_ids"]
+                if project_id in names
+            ]
+        return {"dates": dates, "summaries": summaries}
+
+    def update_team_summary_content(self, summary_date: Any, content: Any) -> dict[str, Any]:
+        summary_date = parse_date(summary_date, "summary_date")
+        content = str(content).strip()
+        if not content:
+            raise ValidationError("日报内容不能为空")
+        if len(content) > 20000:
+            raise ValidationError("日报内容最多 20000 个字符")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE team_daily_summaries SET content=?,created_at=? WHERE summary_date=?",
+                (content, _now(), summary_date),
+            )
+            if not cursor.rowcount:
+                raise NotFoundError("当天尚未生成日报")
+        return self.get_team_summary(summary_date)
+
+    def delete_team_summary(self, summary_date: Any) -> None:
+        summary_date = parse_date(summary_date, "summary_date")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM team_daily_summaries WHERE summary_date=?",
+                (summary_date,),
+            )
+            if not cursor.rowcount:
+                raise NotFoundError("该日尚未生成项目总结")
 
     def update_status_history(self, payload: dict[str, Any]) -> None:
         history_id = parse_id(payload.get("id"), "id")

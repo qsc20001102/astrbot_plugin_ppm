@@ -33,7 +33,7 @@
         <div class="metric-band" id="dashboard-metrics"></div>
         <div class="two-column">
           <section class="surface"><div class="section-head"><div><h2>最近项目</h2><p>按最后更新时间排序</p></div><button class="link-button" data-go="projects">查看全部</button></div><div id="recent-projects"></div></section>
-          <section class="surface"><div class="section-head"><div><h2>本月考勤</h2><p>异常记录与出勤分布</p></div><button class="link-button" data-go="attendance">进入考勤</button></div><div id="attendance-overview" class="attendance-overview"></div></section>
+          <section class="surface"><div class="section-head"><div><h2>本月考勤</h2><p>截至今日的成员月度汇总</p></div><button class="link-button" data-go="attendance">进入考勤</button></div><div id="attendance-overview" class="attendance-overview"></div></section>
         </div>
         <section class="surface quick-start"><div><h2>从今天开始记录</h2><p>先创建成员与项目，再按日添加工作内容。未做特殊说明的法定工作日会自动视为正常出勤。</p></div><div><button class="secondary" data-go="members">管理成员</button><button class="primary" data-go="projects">记录进展</button></div></section>
       </section>
@@ -46,7 +46,7 @@
       <section id="view-attendance" class="view hidden">
         <div class="toolbar"><div class="toolbar-group"><button class="icon-button" id="month-prev">‹</button><input type="month" id="attendance-month" /><button class="icon-button" id="month-next">›</button></div><div class="legend"><span><i class="dot normal"></i>正常</span><span><i class="dot overtime"></i>加班</span><span><i class="dot timeoff"></i>调休</span><span><i class="dot rest"></i>休息日</span></div></div>
         <div class="attendance-layout">
-          <section class="surface calendar-panel"><div class="section-head"><div><h2>公司工作日历</h2><p>点击日期切换上班/休班；支持当前月及未来一个月</p></div><strong id="workdays-count"></strong></div><div id="calendar-grid" class="calendar-grid"></div></section>
+          <section class="surface calendar-panel"><div class="section-head"><div><h2>公司工作日历</h2><p>点击任意日期切换上班/休班；支持任意月份</p></div><strong id="workdays-count"></strong></div><div id="calendar-grid" class="calendar-grid"></div></section>
           <section class="surface"><div class="section-head"><div><h2>成员考勤</h2><p>默认正常出勤，点击单元格登记加班或调休</p></div></div><div class="scroll-table"><table class="attendance-table"><thead id="attendance-head"></thead><tbody id="attendance-body"></tbody></table></div></section>
         </div>
         <section class="surface"><div class="section-head"><div><h2 id="summary-title">月度汇总</h2><p id="summary-range">正常、加班、调休天数及异常明细</p></div><select id="summary-period"><option value="week">周汇总</option><option value="month" selected>月汇总</option><option value="year">年汇总</option></select></div><div class="summary-split"><div id="attendance-summary"></div><div id="attendance-details"></div></div></section>
@@ -54,9 +54,10 @@
 
       <section id="view-projects" class="view hidden">
         <div class="metric-band compact" id="project-metrics"></div>
-        <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="project-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" checked />结束</label><input id="project-search" placeholder="搜索项目名称或进展" /></div><div class="toolbar-group"><button class="secondary" id="team-summary-action">生成多项目日报</button><label>进程表</label><input type="date" id="timeline-start" /><span>至</span><input type="date" id="timeline-end" /></div></div>
-        <section class="surface table-surface"><table><thead><tr><th>项目名称</th><th>状态</th><th>参与成员</th><th>最近进展</th><th>最近更新</th><th>操作</th></tr></thead><tbody id="projects-body"></tbody></table><div id="projects-empty" class="empty hidden">还没有项目，点击右上角创建</div></section>
-        <section class="surface timeline-section"><div class="section-head"><div><h2>所有项目每日进程</h2><p>横向查看每天由谁完成了什么工作</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
+        <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="project-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" />结束</label><input id="project-search" placeholder="搜索项目名称、ID或进展" /></div><div class="toolbar-group"><label>进程表</label><input type="date" id="timeline-start" /><span>至</span><input type="date" id="timeline-end" /></div></div>
+        <section class="surface table-surface"><table><thead><tr><th>项目名称</th><th>状态</th><th>参与成员</th><th>最新记录</th><th>最近更新</th><th>操作</th></tr></thead><tbody id="projects-body"></tbody></table><div id="projects-empty" class="empty hidden">还没有项目，点击右上角创建</div></section>
+        <section class="surface timeline-section"><div class="section-head"><div><h2>项目进程</h2><p>横向查看每天由谁完成了什么工作</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
+        <section class="surface timeline-section"><div class="section-head"><div><h2>项目总结</h2><p>按进程表时间范围查看每日总结，点击方框可生成、查看或修改</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
       </section>
     </main>
   </div>

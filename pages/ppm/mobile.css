@@ -36,4 +36,5 @@
   .modal { max-height: 82vh; }
   #recent-projects .list-row { grid-template-columns: minmax(0, 1fr) auto; }
   #recent-projects .list-row small { display: none; }
+  #recent-projects .list-row .latest-record-date { display: block; }
 }
