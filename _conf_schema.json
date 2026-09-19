@@ -1,4 +1,10 @@
 {
+  "todo_push_session": {
+    "description": "待办推送会话 ID（UMO）",
+    "type": "string",
+    "default": "",
+    "hint": "在目标群聊或私聊发送 /sid，复制完整 UMO（平台ID:消息类型:会话ID），不要仅填写群号。所有开启推送的待办发往此会话；留空时暂停发送并在待办页面显示原因。保存配置后重载插件生效。"
+  },
   "ai_provider_id": {
     "description": "日报总结模型",
     "type": "string",

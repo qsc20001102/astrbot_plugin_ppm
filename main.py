@@ -3,13 +3,14 @@ from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .ppm import Database
 from .ppm.errors import NotFoundError, ValidationError
 from .ppm.web_api import WebApi
+from .ppm.todo_service import TodoReminderService
 
 PLUGIN_NAME = "astrbot_plugin_ppm"
 PROJECT_OVERVIEW_COMMAND = "项目总览"
@@ -95,7 +96,16 @@ class PPMPlugin(Star):
         self.database.initialize()
         self.web_api = WebApi(self.database, context, config)
         self.web_api.register(PLUGIN_NAME)
+        self.todo_reminders = TodoReminderService(
+            self.database, config, self._send_todo_reminder, logger
+        )
         logger.info("PPM plugin initialized; database=%s", data_dir / "ppm.sqlite3")
+
+    async def initialize(self):
+        self.todo_reminders.start()
+
+    async def _send_todo_reminder(self, session: str, text: str) -> bool:
+        return await self.context.send_message(session, MessageChain().message(text))
 
     @filter.command(PROJECT_PROGRESS_COMMAND)
     async def project_process(self, event: AstrMessageEvent):
@@ -179,5 +189,5 @@ class PPMPlugin(Star):
         event.stop_event()
 
     async def terminate(self):
-        """No persistent SQLite connection is held, so shutdown is immediate."""
+        await self.todo_reminders.stop()
         logger.info("PPM plugin terminated")

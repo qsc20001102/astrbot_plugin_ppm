@@ -48,6 +48,20 @@
 .summary-content-editor { min-height: 320px !important; }
 .summary-detail-actions { flex-direction: row; align-items: center; }
 .muted-note { color: var(--muted); font-size: 12px; }
+.todo-notice { margin-bottom: 14px; padding: 12px 16px; border-radius: 8px; background: var(--blue-soft); color: #355586; line-height: 1.6; }
+.todo-notice.needs-config { background: var(--amber-soft); color: #875511; }
+.todo-table { min-width: 850px; }
+.todo-table td { vertical-align: top; }
+.todo-content { min-width: 240px; max-width: 430px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+.todo-table small { display: block; margin-top: 5px; color: var(--muted); max-width: 260px; overflow-wrap: anywhere; }
+.todo-table .push-failed { color: var(--red); }
+.todo-table .status { white-space: nowrap; }
+.todo-push-control { display: flex; align-items: center; gap: 8px; }
+.todo-push-control input { width: auto; }
+.todo-week-heading { display: flex; justify-content: space-between; align-items: center; }
+.todo-weekdays { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px; }
+.todo-weekdays label { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 7px; padding: 8px; }
+.todo-weekdays input { width: auto; accent-color: var(--blue); }
 .preview-save { align-self: flex-end; margin-top: 12px; }
 .modal { max-height: 92vh; }
 @media (max-width: 900px) {

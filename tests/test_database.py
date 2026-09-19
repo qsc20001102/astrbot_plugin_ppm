@@ -17,6 +17,90 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_invalid_input_does_not_create_entities(self):
+        for value in (None, [], {}, True, 123):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.db.save_member({"name": value})
+        for value in (False, 0, 1.5, "1.5", 2**64):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.db.save_member({"id": value, "name": "invalid"})
+        for value in ("12", {}, 1, None):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.db.save_project({"name": "invalid", "member_ids": value})
+        self.assertEqual(self.db.list_members(), [])
+        self.assertEqual(self.db.list_projects(), [])
+
+    def test_duplicate_member_name_is_validation_error(self):
+        member = self.db.save_member({"name": "同名"})
+        with self.assertRaises(ValidationError):
+            self.db.save_member({"name": "同名"})
+        self.db.save_member({"id": member["id"], "name": "同名"})
+        self.db.delete_member(member["id"])
+        self.db.save_member({"name": "同名"})
+
+    def test_delete_preserves_closed_membership_reasons(self):
+        for delete_member in (True, False):
+            member = self.db.save_member({"name": str(delete_member)})
+            project = self.db.save_project({"name": "历史", "member_ids": [member["id"]]})
+            history = self.db.project_detail(project["id"])["membership_history"][0]
+            self.db.update_membership_history({"id": history["id"], "project_id": project["id"],
+                "joined_at": history["joined_at"], "left_at": history["joined_at"], "leave_reason": "原始原因"})
+            if delete_member:
+                self.db.delete_member(member["id"])
+            else:
+                self.db.delete_project(project["id"])
+            with self.db._connection() as conn:
+                row = conn.execute("SELECT * FROM project_memberships WHERE id=?", (history["id"],)).fetchone()
+            self.assertEqual(row["leave_reason"], "原始原因")
+            self.assertEqual(row["left_at"], history["joined_at"])
+
+    def test_invalid_hours_are_rejected_before_writing(self):
+        member = self.db.save_member({"name": "工时"})
+        for value in ("abc", [], {}, True, "nan", "inf", -1, 25):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.db.save_attendance({"member_id": member["id"], "date": "2026-01-01", "hours": value})
+        with self.db._connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM attendance_records").fetchone()[0], 0)
+
+    def test_attendance_details_exclude_deleted_members(self):
+        member = self.db.save_member({"name": "离职"})
+        self.db.save_attendance({"member_id": member["id"], "date": "2026-01-01", "status": "加班"})
+        self.db.delete_member(member["id"])
+        result = self.db.attendance_summary("2026-01-01", "2026-01-02")
+        self.assertEqual(result["summary"], [])
+        self.assertEqual(result["details"], [])
+
+    def test_timeline_rejects_reverse_range_and_excludes_deleted_logs(self):
+        with self.assertRaises(ValidationError):
+            self.db.timeline("2026-02-01", "2026-01-01")
+        project = self.db.save_project({"name": "删除日志"})
+        self.db.save_work_log({"project_id": project["id"], "work_date": "2026-01-01", "content": "保留"})
+        self.db.delete_project(project["id"])
+        self.assertEqual(self.db.timeline("2026-01-01", "2026-01-01")["logs"], {})
+        with self.db._connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM work_logs").fetchone()[0], 1)
+
+    def test_summary_rejects_missing_content_and_invalid_selection(self):
+        for content in (None, {}, [], " ", "x" * 20001):
+            with self.subTest(content_type=type(content)), self.assertRaises(ValidationError):
+                self.db.save_team_summary([], "2026-01-01", "model", content)
+        for ids in ("12", {}, False, 12):
+            with self.subTest(ids=ids), self.assertRaises(ValidationError):
+                self.db.team_summary_material(ids, "2026-01-01")
+        for days in (True, 1.2, "nan"):
+            with self.subTest(days=days), self.assertRaises(ValidationError):
+                self.db.team_summary_material([], "2026-01-01", days)
+        self.assertIsNone(self.db.get_team_summary("2026-01-01"))
+
+    def test_calendar_max_date_and_invalid_month(self):
+        self.assertEqual(len(self.db.get_calendar("9999-12")["days"]), 31)
+        for month in (None, [], "2026-1", "2026-13"):
+            with self.subTest(month=month), self.assertRaises(ValidationError):
+                self.db.get_calendar(month)
+
+    def test_empty_dashboard_has_numeric_metrics(self):
+        self.assertEqual(self.db.dashboard()["metrics"], {"total": 0, "active": 0, "finished": 0, "paused": 0})
+
     def test_project_history_and_membership_are_traceable(self):
         member = self.db.save_member({"name": "张三", "role": "开发"})
         project = self.db.save_project(

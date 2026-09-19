@@ -17,6 +17,7 @@
         <button data-view="members"><span>♙</span>团队成员</button>
         <button data-view="attendance"><span>▣</span>考勤管理</button>
         <button data-view="projects"><span>▰</span>项目管理</button>
+        <button data-view="todos"><span>☑</span>待办事项</button>
       </nav>
       <div class="sidebar-footer"><div class="avatar">管</div><div><strong>管理员</strong><small>PPM 工作区</small></div></div>
     </aside>
@@ -32,7 +33,7 @@
       <section id="view-dashboard" class="view">
         <div class="metric-band" id="dashboard-metrics"></div>
         <div class="two-column">
-          <section class="surface"><div class="section-head"><div><h2>最近项目</h2><p>按最后更新时间排序</p></div><button class="link-button" data-go="projects">查看全部</button></div><div id="recent-projects"></div></section>
+          <section class="surface"><div class="section-head"><div><h2>最近项目</h2><p>按创建顺序展示</p></div><button class="link-button" data-go="projects">查看全部</button></div><div id="recent-projects"></div></section>
           <section class="surface"><div class="section-head"><div><h2>本月考勤</h2><p>截至今日的成员月度汇总</p></div><button class="link-button" data-go="attendance">进入考勤</button></div><div id="attendance-overview" class="attendance-overview"></div></section>
         </div>
         <section class="surface quick-start"><div><h2>从今天开始记录</h2><p>先创建成员与项目，再按日添加工作内容。未做特殊说明的法定工作日会自动视为正常出勤。</p></div><div><button class="secondary" data-go="members">管理成员</button><button class="primary" data-go="projects">记录进展</button></div></section>
@@ -58,6 +59,19 @@
         <section class="surface table-surface"><table><thead><tr><th>项目名称</th><th>状态</th><th>参与成员</th><th>最新记录</th><th>最近更新</th><th>操作</th></tr></thead><tbody id="projects-body"></tbody></table><div id="projects-empty" class="empty hidden">还没有项目，点击右上角创建</div></section>
         <section class="surface timeline-section"><div class="section-head"><div><h2>项目进程</h2><p>横向查看每天由谁完成了什么工作</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
         <section class="surface timeline-section"><div class="section-head"><div><h2>项目总结</h2><p>按进程表时间范围查看每日总结，点击方框可生成、查看或修改</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
+      </section>
+      <section id="view-todos" class="view hidden">
+        <div class="todo-notice" id="todo-push-notice" role="status"></div>
+        <div class="toolbar todo-toolbar">
+          <div class="search-wrap"><input id="todo-search" placeholder="搜索待办内容或项目" aria-label="搜索待办" /></div>
+          <div class="toolbar-group">
+            <select id="todo-project-filter" aria-label="按所属项目筛选"><option value="">全部项目</option></select>
+          </div>
+        </div>
+        <section class="surface table-surface">
+          <table class="todo-table"><thead><tr><th>待办内容</th><th>所属项目</th><th>定时推送</th><th>操作</th></tr></thead><tbody id="todos-body"></tbody></table>
+          <div id="todos-empty" class="empty hidden">暂无待办，点击右上角新增</div>
+        </section>
       </section>
     </main>
   </div>

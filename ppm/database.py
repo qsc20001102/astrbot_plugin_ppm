@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
+import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .calendar_service import date_range, default_is_workday, month_bounds
 from .errors import NotFoundError, ValidationError
+from .todo_schedule import next_weekly, weekly_values
 from .validation import (
     optional_text,
     parse_date,
     parse_datetime,
     parse_id,
+    parse_ids,
+    parse_integer,
     required_text,
 )
 
@@ -45,7 +51,25 @@ class Database:
                 return
             with self._connection() as conn:
                 conn.executescript(SCHEMA)
-                conn.execute("PRAGMA user_version = 1")
+                conn.execute("BEGIN IMMEDIATE")
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
+                if "push_mode" not in columns:
+                    conn.execute("ALTER TABLE todos ADD COLUMN push_mode TEXT NOT NULL DEFAULT 'once'")
+                    conn.execute("ALTER TABLE todos ADD COLUMN push_weekdays TEXT NOT NULL DEFAULT '[]'")
+                    conn.execute("ALTER TABLE todos ADD COLUMN push_time TEXT NOT NULL DEFAULT ''")
+                    conn.execute("ALTER TABLE todos ADD COLUMN push_utc_offset INTEGER NOT NULL DEFAULT 480")
+                if "status" in columns:
+                    # Keep previously stopped reminders stopped when removing task states.
+                    conn.execute("UPDATE todos SET push_enabled=0 WHERE status IN ('已完成','已取消')")
+                    conn.execute(TODO_SCHEMA.replace("todos (", "todos_rebuilt ("))
+                    names = [row["name"] for row in conn.execute("PRAGMA table_info(todos_rebuilt)")]
+                    fields = ",".join(names)
+                    conn.execute(f"INSERT INTO todos_rebuilt({fields}) SELECT {fields} FROM todos")
+                    conn.execute("DROP TABLE todos")
+                    conn.execute("ALTER TABLE todos_rebuilt RENAME TO todos")
+                conn.execute("DROP INDEX IF EXISTS idx_todos_due")
+                conn.execute("CREATE INDEX idx_todos_due ON todos(push_due,retry_at) WHERE deleted_at IS NULL AND push_enabled=1")
+                conn.execute("PRAGMA user_version = 2")
             self._initialized = True
 
     @contextmanager
@@ -73,8 +97,8 @@ class Database:
             metrics = dict(
                 conn.execute(
                     """SELECT COUNT(*) total,
-                SUM(status='进行') active, SUM(status='结束') finished,
-                SUM(status='暂停') paused FROM projects WHERE deleted_at IS NULL"""
+                COALESCE(SUM(status='进行'),0) active, COALESCE(SUM(status='结束'),0) finished,
+                COALESCE(SUM(status='暂停'),0) paused FROM projects WHERE deleted_at IS NULL"""
                 ).fetchone()
             )
             recent = self._rows(
@@ -95,6 +119,142 @@ class Database:
         }
         return {"metrics": metrics, "recent_projects": recent, "attendance": attendance}
 
+    def list_todos(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            return [self._todo_row(row) for row in conn.execute(
+                """SELECT t.*,p.name AS project_name,p.deleted_at AS project_deleted_at
+                FROM todos t JOIN projects p ON p.id=t.project_id
+                WHERE t.deleted_at IS NULL ORDER BY t.id DESC"""
+            )]
+
+    def save_todo(self, payload: dict[str, Any]) -> dict[str, Any]:
+        todo_id = parse_id(payload["id"]) if payload.get("id") is not None else None
+        project_id = parse_id(payload.get("project_id"), "project_id")
+        content = required_text(payload, "content", 3000)
+        enabled = payload.get("push_enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValidationError("push_enabled 必须是布尔值")
+        mode = payload.get("push_mode", "once")
+        if mode not in ("once", "weekly"):
+            raise ValidationError("无效的推送模式")
+        days, clock, offset = [], "", 480
+        push_at = push_due = None
+        if mode == "weekly":
+            days, clock, offset = weekly_values(payload)
+            push_due = next_weekly(time.time(), days, clock, offset)
+        elif payload.get("push_at"):
+            try:
+                parsed = datetime.fromisoformat(str(payload["push_at"]))
+                if parsed.tzinfo is None:
+                    raise ValueError
+                parsed = parsed.astimezone(timezone.utc)
+                push_at = parsed.isoformat(timespec="seconds")
+                push_due = parsed.timestamp()
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValidationError("推送时间必须包含日期、时间和时区") from exc
+        if enabled and push_due is None:
+            raise ValidationError("开启推送后必须设置推送时间")
+        now = _now()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = self._editable_todo(conn, todo_id) if todo_id is not None else None
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not project or (project["deleted_at"] and (not old or old["project_id"] != project_id)):
+                raise ValidationError("请选择存在的项目")
+            if enabled and project["deleted_at"]:
+                raise ValidationError("所属项目已删除，请关闭推送或选择其他项目")
+            reset = not old or any((
+                old["push_at"] != push_at, bool(old["push_enabled"]) != enabled,
+                old["push_mode"] != mode, json.loads(old["push_weekdays"]) != days,
+                old["push_time"] != clock, old["push_utc_offset"] != offset,
+            ))
+            if old and not reset:
+                push_due = old["push_due"]
+            if old:
+                conn.execute(
+                    """UPDATE todos SET project_id=?,content=?,push_enabled=?,push_at=?,push_due=?,
+                    push_mode=?,push_weekdays=?,push_time=?,push_utc_offset=?,
+                    sent_at=CASE WHEN ? THEN NULL ELSE sent_at END,
+                    push_error=CASE WHEN ? THEN '' ELSE push_error END,
+                    retry_at=CASE WHEN ? THEN 0 ELSE retry_at END,
+                    claim_token=NULL,claimed_until=0,updated_at=? WHERE id=?""",
+                    (project_id, content, int(enabled), push_at, push_due, mode, json.dumps(days), clock, offset,
+                     reset, reset, reset, now, todo_id),
+                )
+            else:
+                todo_id = conn.execute(
+                    """INSERT INTO todos(project_id,content,push_enabled,push_at,push_due,
+                    push_mode,push_weekdays,push_time,push_utc_offset,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (project_id, content, int(enabled), push_at, push_due, mode, json.dumps(days), clock, offset, now, now),
+                ).lastrowid
+            return self._todo_row(conn.execute("SELECT * FROM todos WHERE id=?", (todo_id,)).fetchone())
+
+    @staticmethod
+    def _todo_row(row) -> dict[str, Any]:
+        result = dict(row)
+        result["push_weekdays"] = json.loads(result["push_weekdays"])
+        return result
+
+    @staticmethod
+    def _editable_todo(conn: sqlite3.Connection, todo_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM todos WHERE id=? AND deleted_at IS NULL", (todo_id,)).fetchone()
+        if not row:
+            raise NotFoundError("待办不存在")
+        if row["claimed_until"] > time.time():
+            raise ValidationError("该待办正在推送，请稍后再操作")
+        return row
+
+    def delete_todo(self, todo_id: Any) -> None:
+        todo_id = parse_id(todo_id)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._editable_todo(conn, todo_id)
+            now = _now()
+            conn.execute("UPDATE todos SET deleted_at=?,updated_at=?,claim_token=NULL,claimed_until=0 WHERE id=?", (now, now, todo_id))
+
+    def claim_due_todo(self, now: float | None = None) -> dict[str, Any] | None:
+        """Reserve one reminder durably; an interrupted worker's lease expires."""
+        now = time.time() if now is None else now
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Skip missed calendar days rather than replaying a backlog of alarms.
+            for overdue in conn.execute(
+                """SELECT * FROM todos WHERE push_mode='weekly' AND push_enabled=1
+                AND deleted_at IS NULL AND push_due<=? AND claimed_until<=?""", (now, now)
+            ).fetchall():
+                zone = timezone(timedelta(minutes=overdue["push_utc_offset"]))
+                if datetime.fromtimestamp(overdue["push_due"], zone).date() < datetime.fromtimestamp(now, zone).date():
+                    due = next_weekly(now - 1, json.loads(overdue["push_weekdays"]), overdue["push_time"], overdue["push_utc_offset"])
+                    conn.execute("UPDATE todos SET push_due=?,retry_at=0,push_error='' WHERE id=?", (due, overdue["id"]))
+            row = conn.execute(
+                """SELECT t.*,p.name AS project_name FROM todos t JOIN projects p ON p.id=t.project_id
+                WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL
+                AND t.push_enabled=1 AND (t.push_mode='weekly' OR t.sent_at IS NULL)
+                AND t.push_due<=? AND t.retry_at<=? AND t.claimed_until<=?
+                ORDER BY t.push_due,t.id LIMIT 1""", (now, now, now),
+            ).fetchone()
+            if not row:
+                return None
+            token = uuid.uuid4().hex
+            conn.execute("UPDATE todos SET claim_token=?,claimed_until=? WHERE id=?", (token, now + 120, row["id"]))
+            return {**dict(row), "claim_token": token}
+
+    def finish_todo_push(self, todo_id: int, token: str, error: str = "") -> None:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM todos WHERE id=? AND claim_token=?", (todo_id, token)).fetchone()
+            if not row:
+                return
+            due = row["push_due"]
+            if not error and row["push_mode"] == "weekly":
+                due = next_weekly(max(time.time(), due), json.loads(row["push_weekdays"]), row["push_time"], row["push_utc_offset"])
+            conn.execute(
+                """UPDATE todos SET sent_at=?,push_due=?,push_error=?,retry_at=?,claim_token=NULL,claimed_until=0
+                WHERE id=? AND claim_token=?""",
+                (row["sent_at"] if error else _now(), due, error[:500], time.time() + 60 if error else 0, todo_id, token),
+            )
+
     def list_members(self) -> list[dict[str, Any]]:
         with self._connection() as conn:
             rows = self._rows(
@@ -111,15 +271,17 @@ class Database:
                 WHERE m.deleted_at IS NULL GROUP BY m.id ORDER BY m.id"""
                 )
             )
+            projects_by_member: dict[int, list[dict[str, Any]]] = {}
+            for project in self._rows(conn.execute(
+                """SELECT pm.member_id,p.id,p.name,p.status,pm.joined_at,pm.left_at
+                FROM project_memberships pm
+                JOIN projects p ON p.id=pm.project_id AND p.deleted_at IS NULL
+                JOIN members m ON m.id=pm.member_id AND m.deleted_at IS NULL
+                ORDER BY p.id,pm.id"""
+            )):
+                projects_by_member.setdefault(project.pop("member_id"), []).append(project)
             for row in rows:
-                row["projects"] = self._rows(
-                    conn.execute(
-                        """SELECT p.id,p.name,p.status,pm.joined_at,pm.left_at FROM project_memberships pm
-                    JOIN projects p ON p.id=pm.project_id WHERE pm.member_id=? AND p.deleted_at IS NULL
-                    ORDER BY p.id,pm.id""",
-                        (row["id"],),
-                    )
-                )
+                row["projects"] = projects_by_member.get(row["id"], [])
             return rows
 
     def save_member(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -129,8 +291,15 @@ class Database:
         member_id = payload.get("id")
         now = _now()
         with self._connection() as conn:
-            if member_id:
+            conn.execute("BEGIN IMMEDIATE")
+            if member_id is not None:
                 member_id = parse_id(member_id)
+            if conn.execute(
+                "SELECT 1 FROM members WHERE name=? AND deleted_at IS NULL AND id<>?",
+                (name, member_id or 0),
+            ).fetchone():
+                raise ValidationError("已存在同名成员")
+            if member_id is not None:
                 cursor = conn.execute(
                     "UPDATE members SET name=?,role=?,notes=?,updated_at=? WHERE id=? AND deleted_at IS NULL",
                     (name, role, notes, now, member_id),
@@ -159,7 +328,7 @@ class Database:
             if not cursor.rowcount:
                 raise NotFoundError("成员不存在")
             conn.execute(
-                "UPDATE project_memberships SET left_at=COALESCE(left_at,?),leave_reason='成员已删除' WHERE member_id=?",
+                "UPDATE project_memberships SET left_at=COALESCE(left_at,?),leave_reason='成员已删除' WHERE member_id=? AND left_at IS NULL",
                 (_today().isoformat(), member_id),
             )
 
@@ -173,14 +342,16 @@ class Database:
                 FROM projects p WHERE deleted_at IS NULL ORDER BY p.id"""
                 )
             )
+            members_by_project: dict[int, list[dict[str, Any]]] = {}
+            for member in self._rows(conn.execute(
+                """SELECT pm.project_id,m.id,m.name,m.role FROM project_memberships pm
+                JOIN members m ON m.id=pm.member_id AND m.deleted_at IS NULL
+                JOIN projects p ON p.id=pm.project_id AND p.deleted_at IS NULL
+                WHERE pm.left_at IS NULL ORDER BY m.id,pm.id"""
+            )):
+                members_by_project.setdefault(member.pop("project_id"), []).append(member)
             for row in rows:
-                row["members"] = self._rows(
-                    conn.execute(
-                        """SELECT m.id,m.name,m.role FROM project_memberships pm JOIN members m ON m.id=pm.member_id
-                    WHERE pm.project_id=? AND pm.left_at IS NULL AND m.deleted_at IS NULL ORDER BY m.id,pm.id""",
-                        (row["id"],),
-                    )
-                )
+                row["members"] = members_by_project.get(row["id"], [])
             return rows
 
     def list_project_overview(self, statuses: Any = None) -> list[dict[str, Any]]:
@@ -254,9 +425,7 @@ class Database:
         )
         if start_date and end_date and end_date < start_date:
             raise ValidationError("计划结束日期不能早于开始日期")
-        member_ids = {
-            parse_id(value, "member_id") for value in payload.get("member_ids", [])
-        }
+        member_ids = set(parse_ids(payload.get("member_ids", []), "member_ids"))
         project_id = payload.get("id")
         now = _now()
         today = _today().isoformat()
@@ -269,7 +438,7 @@ class Database:
                 ).fetchone()[0]
                 if count != len(member_ids):
                     raise ValidationError("包含不存在的成员")
-            if project_id:
+            if project_id is not None:
                 project_id = parse_id(project_id)
                 old = conn.execute(
                     "SELECT * FROM projects WHERE id=? AND deleted_at IS NULL",
@@ -335,7 +504,7 @@ class Database:
             if not cursor.rowcount:
                 raise NotFoundError("项目不存在")
             conn.execute(
-                "UPDATE project_memberships SET left_at=COALESCE(left_at,?),leave_reason='项目已删除' WHERE project_id=?",
+                "UPDATE project_memberships SET left_at=COALESCE(left_at,?),leave_reason='项目已删除' WHERE project_id=? AND left_at IS NULL",
                 (_today().isoformat(), project_id),
             )
 
@@ -454,6 +623,8 @@ class Database:
     def timeline(self, start: str, end: str) -> dict[str, Any]:
         start_date = date.fromisoformat(parse_date(start, "start"))
         end_date = date.fromisoformat(parse_date(end, "end"))
+        if end_date < start_date:
+            raise ValidationError("end 不能早于 start")
         if (end_date - start_date).days > 62:
             raise ValidationError("进程表最多查询 63 天")
         dates = [d.isoformat() for d in date_range(start_date, end_date)]
@@ -462,6 +633,7 @@ class Database:
             logs = self._rows(
                 conn.execute(
                     """SELECT w.id,w.project_id,w.work_date,w.content FROM work_logs w
+                JOIN projects p ON p.id=w.project_id AND p.deleted_at IS NULL
                 WHERE w.work_date BETWEEN ? AND ? ORDER BY w.id""",
                     (start, end),
                 )
@@ -597,8 +769,13 @@ class Database:
         if status not in ATTENDANCE_STATUSES:
             raise ValidationError("无效的考勤状态")
         raw_hours = payload.get("hours")
-        hours = 8.0 if raw_hours in (None, "") else float(raw_hours)
-        if hours < 0 or hours > 24:
+        try:
+            if isinstance(raw_hours, bool):
+                raise ValueError
+            hours = 8.0 if raw_hours in (None, "") else float(raw_hours)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValidationError("时长必须是 0 到 24 之间的数字") from exc
+        if not math.isfinite(hours) or hours < 0 or hours > 24:
             raise ValidationError("时长必须在 0 到 24 之间")
         note = optional_text(payload, "note", 500)
         with self._connection() as conn:
@@ -640,7 +817,7 @@ class Database:
             details = self._rows(
                 conn.execute(
                     """SELECT a.work_date,a.status,a.hours,a.note,m.name FROM attendance_records a
-                JOIN members m ON m.id=a.member_id WHERE a.work_date BETWEEN ? AND ? AND a.status IN ('加班','调休')
+                JOIN members m ON m.id=a.member_id WHERE m.deleted_at IS NULL AND a.work_date BETWEEN ? AND ? AND a.status IN ('加班','调休')
                 ORDER BY a.work_date DESC,m.id,a.id""",
                     (start, end),
                 )
@@ -688,17 +865,10 @@ class Database:
         self, project_ids: Any, summary_date: Any, history_days: Any = 1
     ) -> tuple[list[int], str]:
         summary_date = parse_date(summary_date, "summary_date")
-        try:
-            history_days = int(history_days)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("history_days 必须是整数") from exc
+        history_days = parse_integer(history_days, "history_days")
         if history_days < 0 or history_days > 30:
             raise ValidationError("history_days 必须在 0 到 30 之间")
-        requested = (
-            []
-            if not project_ids
-            else [parse_id(value, "project_id") for value in project_ids]
-        )
+        requested = parse_ids([] if project_ids is None else project_ids, "project_ids")
         dated_projects = self.summary_projects(summary_date)
         projects = [
             project for project in dated_projects
@@ -753,9 +923,7 @@ class Database:
         overwrite: bool = False,
     ) -> bool:
         summary_date = parse_date(summary_date, "summary_date")
-        content = str(content).strip()
-        if not content:
-            raise ValidationError("日报内容不能为空")
+        content = required_text({"content": content}, "content", 20000)
         with self._connection() as conn:
             if overwrite:
                 conn.execute(
@@ -840,11 +1008,7 @@ class Database:
 
     def update_team_summary_content(self, summary_date: Any, content: Any) -> dict[str, Any]:
         summary_date = parse_date(summary_date, "summary_date")
-        content = str(content).strip()
-        if not content:
-            raise ValidationError("日报内容不能为空")
-        if len(content) > 20000:
-            raise ValidationError("日报内容最多 20000 个字符")
+        content = required_text({"content": content}, "content", 20000)
         with self._connection() as conn:
             cursor = conn.execute(
                 "UPDATE team_daily_summaries SET content=?,created_at=? WHERE summary_date=?",
@@ -938,6 +1102,7 @@ class Database:
         project_id = parse_id(payload.get("project_id"), "project_id")
         joined_at, left_at, join_reason, leave_reason = self._membership_values(payload)
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             item = conn.execute(
                 "SELECT member_id FROM project_memberships WHERE id=? AND project_id=?",
                 (membership_id, project_id),
@@ -964,6 +1129,7 @@ class Database:
         member_id = parse_id(payload.get("member_id"), "member_id")
         joined_at, left_at, join_reason, leave_reason = self._membership_values(payload)
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if not conn.execute(
                 "SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",
                 (project_id,),
@@ -1039,17 +1205,20 @@ CREATE TABLE IF NOT EXISTS project_status_history (
  id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
  from_status TEXT, to_status TEXT NOT NULL, changed_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_status_history_project_date ON project_status_history(project_id,changed_at,id);
 CREATE TABLE IF NOT EXISTS project_memberships (
  id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
  member_id INTEGER NOT NULL REFERENCES members(id), joined_at TEXT NOT NULL, left_at TEXT,
  join_reason TEXT NOT NULL DEFAULT '', leave_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_membership_active ON project_memberships(project_id,member_id) WHERE left_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_membership_member ON project_memberships(member_id,project_id);
 CREATE TABLE IF NOT EXISTS work_logs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
  work_date TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_logs_project_date ON work_logs(project_id,work_date);
+CREATE INDEX IF NOT EXISTS idx_work_logs_date ON work_logs(work_date,project_id);
 CREATE TABLE IF NOT EXISTS calendar_days (
  work_date TEXT PRIMARY KEY, is_workday INTEGER NOT NULL CHECK(is_workday IN (0,1)),
  source TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
@@ -1065,4 +1234,20 @@ CREATE TABLE IF NOT EXISTS team_daily_summaries (
  id INTEGER PRIMARY KEY AUTOINCREMENT, summary_date TEXT NOT NULL UNIQUE,
  project_ids TEXT NOT NULL, provider_id TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
 );
+
 """
+
+TODO_SCHEMA = """
+CREATE TABLE IF NOT EXISTS todos (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
+ content TEXT NOT NULL,
+ push_enabled INTEGER NOT NULL DEFAULT 0 CHECK(push_enabled IN (0,1)), push_at TEXT, push_due REAL,
+ push_mode TEXT NOT NULL DEFAULT 'once' CHECK(push_mode IN ('once','weekly')),
+ push_weekdays TEXT NOT NULL DEFAULT '[]', push_time TEXT NOT NULL DEFAULT '',
+ push_utc_offset INTEGER NOT NULL DEFAULT 480,
+ sent_at TEXT, push_error TEXT NOT NULL DEFAULT '', retry_at REAL NOT NULL DEFAULT 0,
+ claim_token TEXT, claimed_until REAL NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+);
+"""
+SCHEMA += TODO_SCHEMA

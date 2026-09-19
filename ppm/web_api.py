@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Any
 
 from astrbot.api import logger
@@ -28,6 +30,9 @@ class WebApi:
             ("members/save", self.save_member, ["POST"], "Create or update member"),
             ("members/delete", self.delete_member, ["POST"], "Delete member"),
             ("projects", self.projects, ["GET"], "List projects"),
+            ("todos", self.todos, ["GET"], "List project todos and reminder status"),
+            ("todos/save", self.save_todo, ["POST"], "Create or update todo"),
+            ("todos/delete", self.delete_todo, ["POST"], "Delete todo"),
             ("ai/project-summary", self.ai_project_summary, ["POST"], "Generate project lifecycle summary"),
             ("projects/save", self.save_project, ["POST"], "Create or update project"),
             ("projects/delete", self.delete_project, ["POST"], "Delete project"),
@@ -119,12 +124,29 @@ class WebApi:
         ]
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
-                f"/{plugin_name}/{endpoint}", handler, methods, description
+                f"/{plugin_name}/{endpoint}", self._guard(handler), methods, description
             )
+
+    @staticmethod
+    def _guard(handler):
+        @wraps(handler)
+        async def guarded():
+            try:
+                return await handler()
+            except ValidationError as exc:
+                return error_response(str(exc), status_code=400)
+        return guarded
+
+    @staticmethod
+    async def _payload() -> dict[str, Any]:
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            raise ValidationError("请求内容必须是 JSON 对象")
+        return payload
 
     async def _run(self, operation: Callable[[], Any]):
         try:
-            return json_response(operation())
+            return json_response(await asyncio.to_thread(operation))
         except ValidationError as exc:
             return error_response(str(exc), status_code=400)
         except NotFoundError as exc:
@@ -134,7 +156,10 @@ class WebApi:
             return error_response(f"操作失败：{exc}", status_code=500)
 
     async def health(self):
-        return json_response({"ok": True, "version": 1})
+        return json_response({"ok": True, "version": 1, "settings": {
+            "company_name": self.config.get("company_name") or "我的团队",
+            "week_start": "sunday" if self.config.get("week_start") == "sunday" else "monday",
+        }})
 
     async def dashboard(self):
         return await self._run(self.db.dashboard)
@@ -143,11 +168,11 @@ class WebApi:
         return await self._run(lambda: self.db.list_members())
 
     async def save_member(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self.db.save_member(payload))
 
     async def delete_member(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted(self.db.delete_member, payload.get("id"))
         )
@@ -158,12 +183,24 @@ class WebApi:
             return await self._run(lambda: self.db.summary_projects(summary_date))
         return await self._run(lambda: self.db.list_projects())
 
+    async def todos(self):
+        configured = bool(str(self.config.get("todo_push_session", "") or "").strip())
+        return await self._run(lambda: {"todos": self.db.list_todos(), "push_configured": configured})
+
+    async def save_todo(self):
+        payload = await self._payload()
+        return await self._run(lambda: self.db.save_todo(payload))
+
+    async def delete_todo(self):
+        payload = await self._payload()
+        return await self._run(lambda: self._deleted(self.db.delete_todo, payload.get("id")))
+
     async def save_project(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self.db.save_project(payload))
 
     async def delete_project(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted(self.db.delete_project, payload.get("id"))
         )
@@ -172,7 +209,7 @@ class WebApi:
         return await self._run(lambda: self.db.project_detail(request.query.get("id")))
 
     async def save_work_log(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self.db.save_work_log(payload))
 
     async def work_logs(self):
@@ -183,25 +220,25 @@ class WebApi:
         )
 
     async def delete_work_log(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted(self.db.delete_work_log, payload.get("id"))
         )
 
     async def save_status_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._saved(self.db.update_status_history, payload)
         )
 
     async def add_status_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._saved(self.db.insert_status_history, payload)
         )
 
     async def delete_status_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted_pair(
                 self.db.delete_status_history,
@@ -211,19 +248,19 @@ class WebApi:
         )
 
     async def save_membership_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._saved(self.db.update_membership_history, payload)
         )
 
     async def add_membership_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._saved(self.db.insert_membership_history, payload)
         )
 
     async def delete_membership_history(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted_pair(
                 self.db.delete_membership_history,
@@ -243,7 +280,7 @@ class WebApi:
         return await self._run(lambda: self.db.get_calendar(month))
 
     async def save_calendar(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self._saved(self.db.save_calendar_day, payload))
 
     async def attendance(self):
@@ -251,7 +288,7 @@ class WebApi:
         return await self._run(lambda: self.db.attendance_matrix(month))
 
     async def save_attendance(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self._saved(self.db.save_attendance, payload))
 
     async def attendance_summary(self):
@@ -273,12 +310,13 @@ class WebApi:
         if not provider_id:
             raise ValidationError("请先在插件配置中选择日报总结模型")
         summary_date = parse_date(summary_date, "summary_date")
-        project_ids, material = self.db.team_summary_material(
-            project_ids, summary_date, history_days
+        project_ids, material = await asyncio.to_thread(
+            self.db.team_summary_material, project_ids, summary_date, history_days
         )
         prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n以下是项目资料：\n{material}"
         content = await self._generate_text(provider_id, prompt)
-        persisted = self.db.save_team_summary(
+        persisted = await asyncio.to_thread(
+            self.db.save_team_summary,
             project_ids,
             summary_date,
             provider_id,
@@ -293,7 +331,7 @@ class WebApi:
         }
 
     async def generate_project_summary(self, project_id: Any) -> str:
-        material = self.db.project_lifecycle_material(project_id)
+        material = await asyncio.to_thread(self.db.project_lifecycle_material, project_id)
         provider_id = str(self.config.get("ai_provider_id", "")).strip()
         if not provider_id:
             raise ValidationError("请先在插件配置中选择日报总结模型")
@@ -305,13 +343,13 @@ class WebApi:
             chat_provider_id=provider_id,
             prompt=prompt,
         )
-        content = str(response.completion_text).strip()
-        if not content:
+        content = response.completion_text
+        if not isinstance(content, str) or not content.strip():
             raise RuntimeError("模型返回了空内容")
-        return content
+        return content.strip()
 
     async def ai_project_summary(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         try:
             content = await self.generate_project_summary(payload.get("project_id"))
             return json_response({"content": content})
@@ -322,7 +360,7 @@ class WebApi:
             return error_response(f"项目总结生成失败：{exc}", status_code=502)
 
     async def ai_summary(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         try:
             overwrite = payload.get("overwrite", False)
             if not isinstance(overwrite, bool):
@@ -351,11 +389,11 @@ class WebApi:
         )
 
     async def save_summary_content(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(lambda: self._save_summary(payload))
 
     async def delete_summary(self):
-        payload = await request.json(default={})
+        payload = await self._payload()
         return await self._run(
             lambda: self._deleted(
                 self.db.delete_team_summary,

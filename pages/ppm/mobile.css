@@ -1,4 +1,7 @@
 @media (max-width: 640px) {
+  #view-members .table-surface table,
+  #view-projects .table-surface table { min-width: 720px; }
+  .member-cell { min-width: 150px; }
   body { padding-bottom: 66px; }
   .app-shell { display: block; }
   .sidebar {
@@ -12,7 +15,7 @@
     padding: 6px 8px;
   }
   .brand, .sidebar-footer { display: none; }
-  .sidebar nav { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+  .sidebar nav { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
   .sidebar nav button, .sidebar nav button:not(.active) {
     height: 50px;
     padding: 4px;
