@@ -30,10 +30,12 @@ class WebApi:
             ("members/save", self.save_member, ["POST"], "Create or update member"),
             ("members/delete", self.delete_member, ["POST"], "Delete member"),
             ("projects", self.projects, ["GET"], "List projects"),
+            ("tasks", self.tasks, ["GET"], "Project tasks and lifecycle history"),
+            ("tasks/save", self.save_task, ["POST"], "Create or update project task"),
+            ("tasks/delete", self.delete_task, ["POST"], "Soft delete project task"),
             ("todos", self.todos, ["GET"], "List project todos and reminder status"),
             ("todos/save", self.save_todo, ["POST"], "Create or update todo"),
             ("todos/delete", self.delete_todo, ["POST"], "Delete todo"),
-            ("ai/project-summary", self.ai_project_summary, ["POST"], "Generate project lifecycle summary"),
             ("projects/save", self.save_project, ["POST"], "Create or update project"),
             ("projects/delete", self.delete_project, ["POST"], "Delete project"),
             (
@@ -157,8 +159,8 @@ class WebApi:
 
     async def health(self):
         return json_response({"ok": True, "version": 1, "settings": {
-            "company_name": self.config.get("company_name") or "我的团队",
             "week_start": "sunday" if self.config.get("week_start") == "sunday" else "monday",
+            "ui_color_theme": self.config.get("ui_color_theme") if self.config.get("ui_color_theme") in ("forest", "ocean", "violet", "amber") else "forest",
         }})
 
     async def dashboard(self):
@@ -182,6 +184,17 @@ class WebApi:
         if summary_date is not None:
             return await self._run(lambda: self.db.summary_projects(summary_date))
         return await self._run(lambda: self.db.list_projects())
+
+    async def tasks(self):
+        return await self._run(lambda: self.db.list_tasks(request.query.get("project_id")))
+
+    async def save_task(self):
+        payload = await self._payload()
+        return await self._run(lambda: self.db.save_task(payload))
+
+    async def delete_task(self):
+        payload = await self._payload()
+        return await self._run(lambda: self._deleted_pair(self.db.delete_task, payload.get("id"), payload.get("project_id")))
 
     async def todos(self):
         configured = bool(str(self.config.get("todo_push_session", "") or "").strip())
@@ -313,7 +326,14 @@ class WebApi:
         project_ids, material = await asyncio.to_thread(
             self.db.team_summary_material, project_ids, summary_date, history_days
         )
-        prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n以下是项目资料：\n{material}"
+        rules = (
+            "日报资料按项目和任务分组。只把当日记录视为当日工作；任务状态、任务变更、完成日期和记录文字须分别解读。"
+            "任务状态按截至总结日期的最后历史快照还原，缺少当日快照时不可推断状态或进度。"
+            "已完成任务不一定在当天完成；重新打开、删除或补录历史完成日期不代表当天产出。"
+            "无当天记录的任务仅供背景参考，未完成任务不自动成为明日承诺。项目级记录同样需要归纳。"
+            "历史日报只用于衔接，不能当作今日工作；不得虚构未提供的风险、计划或成果。"
+        )
+        prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n资料解读规则：{rules}\n\n以下是项目资料：\n{material}"
         content = await self._generate_text(provider_id, prompt)
         persisted = await asyncio.to_thread(
             self.db.save_team_summary,
@@ -330,14 +350,6 @@ class WebApi:
             "persisted": persisted,
         }
 
-    async def generate_project_summary(self, project_id: Any) -> str:
-        material = await asyncio.to_thread(self.db.project_lifecycle_material, project_id)
-        provider_id = str(self.config.get("ai_provider_id", "")).strip()
-        if not provider_id:
-            raise ValidationError("请先在插件配置中选择日报总结模型")
-        prompt = f"{self.config.get('ai_project_summary_prompt', '')}\n\n以下是项目全生命周期资料：\n{material}"
-        return await self._generate_text(provider_id, prompt)
-
     async def _generate_text(self, provider_id: str, prompt: str) -> str:
         response = await self.context.llm_generate(
             chat_provider_id=provider_id,
@@ -347,17 +359,6 @@ class WebApi:
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("模型返回了空内容")
         return content.strip()
-
-    async def ai_project_summary(self):
-        payload = await self._payload()
-        try:
-            content = await self.generate_project_summary(payload.get("project_id"))
-            return json_response({"content": content})
-        except (ValidationError, NotFoundError) as exc:
-            return error_response(str(exc), status_code=400)
-        except Exception as exc:  # noqa: BLE001 - normalize provider failures for WebUI
-            logger.exception("PPM project lifecycle summary generation failed")
-            return error_response(f"项目总结生成失败：{exc}", status_code=502)
 
     async def ai_summary(self):
         payload = await self._payload()

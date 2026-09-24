@@ -15,6 +15,7 @@ from typing import Any
 from .calendar_service import date_range, default_is_workday, month_bounds
 from .errors import NotFoundError, ValidationError
 from .todo_schedule import next_weekly, weekly_values
+from .task_repository import TASK_SCHEMA, TaskRepository
 from .validation import (
     optional_text,
     parse_date,
@@ -27,11 +28,10 @@ from .validation import (
 
 PROJECT_STATUS_ORDER = ("准备", "进行", "维护", "暂停", "结束")
 PROJECT_STATUSES = set(PROJECT_STATUS_ORDER)
-DEFAULT_PROJECT_OVERVIEW_STATUSES = PROJECT_STATUS_ORDER[:-1]
 ATTENDANCE_STATUSES = {"正常", "加班", "调休"}
 
 
-class Database:
+class Database(TaskRepository):
     """SQLite repository and application service for PPM.
 
     A connection is created per operation so Web API requests can safely run on
@@ -69,7 +69,11 @@ class Database:
                     conn.execute("ALTER TABLE todos_rebuilt RENAME TO todos")
                 conn.execute("DROP INDEX IF EXISTS idx_todos_due")
                 conn.execute("CREATE INDEX idx_todos_due ON todos(push_due,retry_at) WHERE deleted_at IS NULL AND push_enabled=1")
-                conn.execute("PRAGMA user_version = 2")
+                log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(work_logs)")}
+                if "task_id" not in log_columns:
+                    conn.execute("ALTER TABLE work_logs ADD COLUMN task_id INTEGER REFERENCES project_tasks(id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_work_logs_task ON work_logs(task_id,work_date)")
+                conn.execute("PRAGMA user_version = 3")
             self._initialized = True
 
     @contextmanager
@@ -352,36 +356,15 @@ class Database:
                 members_by_project.setdefault(member.pop("project_id"), []).append(member)
             for row in rows:
                 row["members"] = members_by_project.get(row["id"], [])
+            counts = {row["project_id"]: dict(row) for row in conn.execute(
+                "SELECT project_id,COUNT(*) task_count,SUM(status='完成') completed_task_count FROM project_tasks WHERE deleted_at IS NULL GROUP BY project_id"
+            )}
+            for row in rows:
+                count = counts.get(row["id"], {})
+                row["task_count"] = count.get("task_count", 0)
+                row["completed_task_count"] = count.get("completed_task_count", 0)
+                row["progress"] = int(row["completed_task_count"] * 100 / row["task_count"] + .5) if row["task_count"] else 0
             return rows
-
-    def list_project_overview(self, statuses: Any = None) -> list[dict[str, Any]]:
-        """Return project IDs, names and statuses for the message overview command."""
-        if isinstance(statuses, str):
-            statuses = [statuses]
-        requested = [str(status).strip() for status in (statuses or [])]
-        requested = list(dict.fromkeys(status for status in requested if status))
-        invalid = [status for status in requested if status not in PROJECT_STATUSES]
-        if invalid:
-            invalid_text = "、".join(dict.fromkeys(invalid))
-            available = "、".join(PROJECT_STATUS_ORDER)
-            raise ValidationError(
-                f"项目状态输入错误：{invalid_text}\n"
-                f"正确写法：/项目总览 [状态] [状态] ...\n"
-                f"可用状态：{available}\n"
-                "不填写状态时默认查询除结束外的项目。"
-            )
-        if not requested:
-            requested = list(DEFAULT_PROJECT_OVERVIEW_STATUSES)
-        placeholders = ",".join("?" * len(requested))
-        with self._connection() as conn:
-            return self._rows(
-                conn.execute(
-                    f"""SELECT id,name,status FROM projects
-                    WHERE deleted_at IS NULL AND status IN ({placeholders})
-                    ORDER BY id""",
-                    requested,
-                )
-            )
 
     def summary_projects(self, summary_date: Any) -> list[dict[str, Any]]:
         """Return project states at the end of the requested calendar day."""
@@ -390,13 +373,15 @@ class Database:
             return self._rows(conn.execute(
                 """SELECT p.id,p.name,h.to_status AS status,
                 EXISTS(SELECT 1 FROM work_logs w WHERE w.project_id=p.id
-                       AND w.work_date=?) AS has_records
+                       AND w.work_date=?) AS has_records,
+                EXISTS(SELECT 1 FROM task_history th JOIN project_tasks t ON t.id=th.task_id
+                       WHERE t.project_id=p.id AND substr(th.changed_at,1,10)=?) AS has_task_changes
                 FROM projects p JOIN project_status_history h ON h.id=(
                     SELECT id FROM project_status_history
                     WHERE project_id=p.id AND substr(changed_at,1,10)<=?
                     ORDER BY changed_at DESC,id DESC LIMIT 1
                 ) WHERE p.deleted_at IS NULL ORDER BY p.id""",
-                (summary_date, summary_date),
+                (summary_date, summary_date, summary_date),
             ))
 
     def list_default_summary_project_ids(self, summary_date: Any = None) -> list[int]:
@@ -404,7 +389,7 @@ class Database:
         return [
             project["id"]
             for project in self.summary_projects(summary_date or _today().isoformat())
-            if project["has_records"]
+            if project["has_records"] or project["has_task_changes"]
         ]
 
     def save_project(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -508,28 +493,6 @@ class Database:
                 (_today().isoformat(), project_id),
             )
 
-    def project_lifecycle_material(self, project_id: Any) -> str:
-        project_id = parse_id(project_id)
-        with self._connection() as conn:
-            project = conn.execute(
-                "SELECT id,name,description,status,start_date,end_date,created_at FROM projects WHERE id=? AND deleted_at IS NULL",
-                (project_id,),
-            ).fetchone()
-            if not project:
-                raise NotFoundError("项目不存在")
-            history = self._rows(conn.execute(
-                "SELECT from_status,to_status,changed_at,note FROM project_status_history WHERE project_id=? ORDER BY changed_at,id",
-                (project_id,),
-            ))
-            logs = self._rows(conn.execute(
-                "SELECT work_date,content FROM work_logs WHERE project_id=? ORDER BY work_date,id",
-                (project_id,),
-            ))
-        for log in logs:
-            log["status_on_date"] = self._status_on_date(history, log["work_date"])
-        return json.dumps({"project": dict(project), "status_history": history,
-                           "work_logs": logs}, ensure_ascii=False)
-
     def project_detail(self, project_id: Any) -> dict[str, Any]:
         project_id = parse_id(project_id)
         with self._connection() as conn:
@@ -555,11 +518,14 @@ class Database:
             )
             result["work_logs"] = self._rows(
                 conn.execute(
-                    """SELECT w.* FROM work_logs w
-                WHERE w.project_id=? ORDER BY w.id DESC LIMIT 60""",
+                    """SELECT w.*,t.name task_name,t.deleted_at task_deleted_at FROM work_logs w
+                LEFT JOIN project_tasks t ON t.id=w.task_id
+                WHERE w.project_id=? ORDER BY w.work_date DESC,w.id DESC""",
                     (project_id,),
                 )
             )
+            result["tasks"] = self._project_tasks(conn, project_id)
+            result.update(self._progress(result["tasks"]))
             return result
 
     def save_work_log(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -569,23 +535,28 @@ class Database:
         content = required_text(payload, "content", 4000)
         now = _now()
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if not conn.execute(
                 "SELECT 1 FROM projects WHERE id=? AND deleted_at IS NULL",
                 (project_id,),
             ).fetchone():
                 raise NotFoundError("项目不存在")
+            old = conn.execute("SELECT * FROM work_logs WHERE id=? AND project_id=?", (log_id, project_id)).fetchone() if log_id else None
+            if log_id and not old:
+                raise NotFoundError("工作记录不存在")
+            task_id = self._log_task(conn, payload, old, project_id, work_date, now)
             if log_id:
                 cursor = conn.execute(
-                    """UPDATE work_logs SET work_date=?,content=?,updated_at=?
+                    """UPDATE work_logs SET work_date=?,content=?,updated_at=?,task_id=?
                     WHERE id=? AND project_id=?""",
-                    (work_date, content, now, log_id, project_id),
+                    (work_date, content, now, task_id, log_id, project_id),
                 )
                 if not cursor.rowcount:
                     raise NotFoundError("工作记录不存在")
             else:
                 log_id = conn.execute(
-                    "INSERT INTO work_logs(project_id,work_date,content,created_at,updated_at) VALUES(?,?,?,?,?)",
-                    (project_id, work_date, content, now, now),
+                    "INSERT INTO work_logs(project_id,work_date,content,created_at,updated_at,task_id) VALUES(?,?,?,?,?,?)",
+                    (project_id, work_date, content, now, now, task_id),
                 ).lastrowid
             conn.execute(
                 "UPDATE projects SET updated_at=? WHERE id=?", (now, project_id)
@@ -606,8 +577,9 @@ class Database:
                 raise NotFoundError("项目不存在")
             logs = self._rows(
                 conn.execute(
-                    """SELECT id,project_id,work_date,content,created_at,updated_at
-                    FROM work_logs WHERE project_id=? AND work_date=? ORDER BY id""",
+                    """SELECT w.*,t.name task_name,t.deleted_at task_deleted_at
+                    FROM work_logs w LEFT JOIN project_tasks t ON t.id=w.task_id
+                    WHERE w.project_id=? AND w.work_date=? ORDER BY w.id""",
                     (project_id, work_date),
                 )
             )
@@ -632,7 +604,8 @@ class Database:
         with self._connection() as conn:
             logs = self._rows(
                 conn.execute(
-                    """SELECT w.id,w.project_id,w.work_date,w.content FROM work_logs w
+                    """SELECT w.id,w.project_id,w.work_date,w.content,w.task_id,t.name task_name FROM work_logs w
+                LEFT JOIN project_tasks t ON t.id=w.task_id
                 JOIN projects p ON p.id=w.project_id AND p.deleted_at IS NULL
                 WHERE w.work_date BETWEEN ? AND ? ORDER BY w.id""",
                     (start, end),
@@ -873,7 +846,7 @@ class Database:
         projects = [
             project for project in dated_projects
             if (project["id"] in requested if requested
-                else project["has_records"])
+                else project["has_records"] or project["has_task_changes"])
         ]
         if requested and len(projects) != len(set(requested)):
             raise ValidationError("包含不存在或所选日期尚未建立的项目")
@@ -882,13 +855,15 @@ class Database:
             for project in projects:
                 logs = self._rows(
                     conn.execute(
-                        "SELECT content FROM work_logs WHERE project_id=? AND work_date=? ORDER BY id",
+                        """SELECT w.id,w.content,w.task_id FROM work_logs w
+                        WHERE w.project_id=? AND w.work_date=? ORDER BY w.id""",
                         (project["id"], summary_date),
                     )
                 )
                 sections.append(
-                    f"项目：{project['name']}\n状态：{project['status']}\n今日记录：\n"
-                    + ("\n".join(f"- {log['content']}" for log in logs) or "- 无记录")
+                    f"项目：{project['name']}（ID：{project['id']}）\n状态：{project['status']}\n"
+                    f"当日工作记录：{len(logs)} 条\n"
+                    + json.dumps(self._task_summary_material(conn, project["id"], summary_date, logs), ensure_ascii=False)
                 )
             history = []
             if history_days:
@@ -907,7 +882,10 @@ class Database:
                 )
         if not projects:
             raise ValidationError("没有可生成日报的项目")
-        material = f"日期：{summary_date}\n\n" + "\n\n".join(sections)
+        material = (f"日期：{summary_date}\n"
+                    "任务状态和进度依据截至该日的历史快照；无快照的关联任务状态未知，不计入已知进度。"
+                    "记录内容采用该日记录的最新修订。无当日记录不代表有实际工作产出。\n\n"
+                    + "\n\n".join(sections))
         if history:
             material += "\n\n前几天已生成的团队总结：\n" + "\n\n".join(
                 f"[{item['summary_date']}]\n{item['content']}" for item in history
@@ -972,7 +950,7 @@ class Database:
         if end_date < start_date:
             raise ValidationError("end 不能早于 start")
         if (end_date - start_date).days > 62:
-            raise ValidationError("项目总结最多查询 63 天")
+            raise ValidationError("每日总结最多查询 63 天")
         dates = [day.isoformat() for day in date_range(start_date, end_date)]
         with self._connection() as conn:
             summaries = self._rows(
@@ -1026,7 +1004,7 @@ class Database:
                 (summary_date,),
             )
             if not cursor.rowcount:
-                raise NotFoundError("该日尚未生成项目总结")
+                raise NotFoundError("该日尚未生成每日总结")
 
     def update_status_history(self, payload: dict[str, Any]) -> None:
         history_id = parse_id(payload.get("id"), "id")
@@ -1250,4 +1228,4 @@ CREATE TABLE IF NOT EXISTS todos (
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
 );
 """
-SCHEMA += TODO_SCHEMA
+SCHEMA += TODO_SCHEMA + TASK_SCHEMA

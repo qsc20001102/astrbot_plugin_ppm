@@ -76,8 +76,53 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_only_exposes_display_settings(self):
         self.api.config.update(company_name="测试团队", week_start="sunday", secret="private")
         result = await self.api.health()
-        self.assertEqual(result["data"]["settings"], {"company_name": "测试团队", "week_start": "sunday"})
+        self.assertEqual(result["data"]["settings"], {"week_start": "sunday", "ui_color_theme": "forest"})
         self.assertNotIn("secret", str(result))
+
+    async def test_task_routes_forward_payload_and_project_scope(self):
+        self.api.register("ppm")
+        routes = {call.args[0]: call.args[1] for call in self.context.register_web_api.call_args_list}
+        module.request.query = {"project_id": "7"}
+        self.db.list_tasks.return_value = []
+        response = await routes["/ppm/tasks"]()
+        self.assertEqual(response["status"], 200)
+        self.db.list_tasks.assert_called_once_with("7")
+        payload = {"project_id": 7, "name": "评审", "status": "未完成"}
+        module.request.json.return_value = payload
+        self.db.save_task.return_value = {"id": 3, **payload}
+        response = await routes["/ppm/tasks/save"]()
+        self.assertEqual(response["data"]["id"], 3)
+        self.db.save_task.assert_called_once_with(payload)
+        module.request.json.return_value = {"id": 3, "project_id": 7}
+        response = await routes["/ppm/tasks/delete"]()
+        self.assertTrue(response["data"]["deleted"])
+        self.db.delete_task.assert_called_once_with(3, 7)
+
+    async def test_theme_settings_validate_supported_palettes(self):
+        for value in ("forest", "ocean", "violet", "amber", "bad", "", None, []):
+            self.api.config["ui_color_theme"] = value
+            response = await self.api.health()
+            expected = value if value in ("forest", "ocean", "violet", "amber") else "forest"
+            self.assertEqual(response["data"]["settings"]["ui_color_theme"], expected)
+
+    async def test_project_summary_route_and_config_are_removed(self):
+        import json
+        self.api.register("ppm")
+        paths = [call.args[0] for call in self.context.register_web_api.call_args_list]
+        self.assertNotIn("/ppm/ai/project-summary", paths)
+        self.assertIn("/ppm/ai/summary", paths)
+        schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertNotIn("ai_project_summary_prompt", schema)
+        self.assertEqual(schema["ui_color_theme"]["options"], ["forest", "ocean", "violet", "amber"])
+
+    async def test_daily_prompt_explains_task_state_and_history_even_with_custom_prompt(self):
+        self.api.config["ai_summary_prompt"] = "我的自定义提示词"
+        self.db.team_summary_material.return_value = ([1], "分组后的任务资料")
+        self.context.llm_generate = AsyncMock(return_value=SimpleNamespace(completion_text="任务日报"))
+        await self.api.generate_summary([1], "2026-01-01")
+        prompt = self.context.llm_generate.call_args.kwargs["prompt"]
+        for expected in ("我的自定义提示词", "分组后的任务资料", "最后历史快照", "项目级记录", "重新打开", "不能当作今日工作"):
+            self.assertIn(expected, prompt)
 
 
 if __name__ == "__main__":

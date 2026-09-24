@@ -1,0 +1,79 @@
+/* Shared theme tokens. The plugin configuration selects the data attribute. */
+:root {
+  --nav-bg: #172521;
+  --nav-text: #c6d2ce;
+  --nav-muted: #96aaa0;
+  --nav-border: #40534b;
+  --accent-hover: #c8e859;
+  --theme-solid: #23634c;
+  --theme-soft: #eaf3ee;
+  --theme-panel: #f4f7f5;
+  --theme-table: #edf2ef;
+  --theme-bar: #7fa887;
+  --theme-openbar: #78a58e;
+  --theme-focus: #23634c15;
+  --blue: var(--theme-solid);
+  --green: var(--theme-solid);
+  --blue-soft: var(--theme-soft);
+  --green-soft: var(--theme-soft);
+}
+
+:root[data-color-theme="ocean"] {
+  --bg: #f3f6fa;
+  --ink: #182b42;
+  --muted: #64758a;
+  --border: #dce4ed;
+  --nav-bg: #15283e;
+  --nav-text: #cbd9e9;
+  --nav-muted: #9bafc7;
+  --nav-border: #395570;
+  --accent: #a8d9ff;
+  --accent-hover: #91cdff;
+  --theme-solid: #276399;
+  --theme-soft: #e8f1fa;
+  --theme-panel: #f3f7fb;
+  --theme-table: #edf2f8;
+  --theme-bar: #83aace;
+  --theme-openbar: #7dadd1;
+  --theme-focus: #27639918;
+}
+
+:root[data-color-theme="violet"] {
+  --bg: #f6f4fa;
+  --ink: #2d2340;
+  --muted: #776985;
+  --border: #e4deed;
+  --nav-bg: #2a203b;
+  --nav-text: #dfd4ed;
+  --nav-muted: #b5a4c8;
+  --nav-border: #58456f;
+  --accent: #d9c2ff;
+  --accent-hover: #c9a9f5;
+  --theme-solid: #715098;
+  --theme-soft: #f0eafa;
+  --theme-panel: #f7f4fb;
+  --theme-table: #f0ecf6;
+  --theme-bar: #ac91c7;
+  --theme-openbar: #ad97c9;
+  --theme-focus: #71509818;
+}
+
+:root[data-color-theme="amber"] {
+  --bg: #f8f5f0;
+  --ink: #392b20;
+  --muted: #807264;
+  --border: #e9e0d5;
+  --nav-bg: #33281f;
+  --nav-text: #e6d8c8;
+  --nav-muted: #c1ab93;
+  --nav-border: #6c5540;
+  --accent: #f5d38b;
+  --accent-hover: #ecc377;
+  --theme-solid: #8b5b2a;
+  --theme-soft: #f8eedf;
+  --theme-panel: #faf6ef;
+  --theme-table: #f4eee5;
+  --theme-bar: #c2a078;
+  --theme-openbar: #c6a580;
+  --theme-focus: #8b5b2a18;
+}

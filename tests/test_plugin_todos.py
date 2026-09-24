@@ -15,7 +15,11 @@ class PluginTodoLifecycleTests(unittest.IsolatedAsyncioTestCase):
         api.AstrBotConfig, api.logger = dict, Mock()
         events = ModuleType("astrbot.api.event")
         events.AstrMessageEvent = object
-        events.filter = SimpleNamespace(command=lambda _: lambda handler: handler)
+        commands = []
+        def command(name):
+            commands.append(name)
+            return lambda handler: handler
+        events.filter = SimpleNamespace(command=command)
         chain = Mock()
         events.MessageChain = Mock(return_value=chain)
         stars = ModuleType("astrbot.api.star")
@@ -37,6 +41,7 @@ class PluginTodoLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 spec = importlib.util.spec_from_file_location("_ppm_plugin_test.main", root / "main.py")
                 main = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(main)
+                self.assertEqual(commands, ["每日总结"])
                 context = Mock()
                 context.send_message = AsyncMock(return_value=True)
                 plugin = main.PPMPlugin(context, {})

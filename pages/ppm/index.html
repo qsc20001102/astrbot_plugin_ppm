@@ -7,37 +7,23 @@
   <link rel="stylesheet" href="./style.css" />
   <link rel="stylesheet" href="./mobile.css" />
   <link rel="stylesheet" href="./refinements.css" />
+  <link rel="stylesheet" href="./workbench.css" />
+  <link rel="stylesheet" href="./themes.css" />
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">P</span><div><strong>PPM</strong><small>项目进度管理</small></div></div>
-      <nav id="nav">
-        <button data-view="dashboard" class="active"><span>⌂</span>工作台</button>
-        <button data-view="members"><span>♙</span>团队成员</button>
-        <button data-view="attendance"><span>▣</span>考勤管理</button>
-        <button data-view="projects"><span>▰</span>项目管理</button>
-        <button data-view="todos"><span>☑</span>待办事项</button>
-      </nav>
-      <div class="sidebar-footer"><div class="avatar">管</div><div><strong>管理员</strong><small>PPM 工作区</small></div></div>
+      <div class="brand"><div><strong>PPM</strong><small>项目进度管理</small></div></div>
+      <nav id="nav"><button data-view="projects" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h6l2 2h10v12H3z M3 6V4h7l2 2"/></svg>项目列表</button><button data-view="project-records"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z M14 3v5h5 M9 12h7 M9 16h7"/></svg>项目记录</button><button data-view="project-detail" aria-controls="project-submenu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11 M12 19V4 M19 19V8"/></svg>项目详情</button><div id="project-submenu" class="project-submenu" aria-label="所有项目"></div><button data-view="todos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M8 12l3 3 6-7"/></svg>待办事项</button><button data-view="members"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-3a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v3 M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M18 9a3 3 0 0 0 0-6 M22 21v-3a4 4 0 0 0-3-4"/></svg>团队成员</button><button data-view="attendance"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v16H4z M8 2v6 M16 2v6 M4 10h16"/></svg>考勤管理</button></nav><div class="sidebar-caption">从任务出发<br><strong>让每一步都有迹可循。</strong></div>
     </aside>
 
     <main>
       <header class="topbar">
-        <div><h1 id="page-title">工作台</h1><p id="page-subtitle">团队项目与考勤概览</p></div>
-        <div class="top-actions"><span id="today-label"></span><button class="icon-button" id="refresh" title="刷新">↻</button><button class="primary" id="primary-action">新建项目</button></div>
+        <div><h1 id="page-title">项目列表</h1><p id="page-subtitle">项目状态、参与成员与项目档案</p></div>
+        <div class="top-actions"><span id="today-label"></span><button class="icon-button" id="refresh" title="刷新" aria-label="刷新"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5 M20 12a8 8 0 1 0-2 6 M20 12l-4-5"/></svg></button><button class="primary" id="primary-action">新建项目</button></div>
       </header>
       <div id="loading" class="loading hidden">正在加载…</div>
       <div id="toast" class="toast hidden"></div>
-
-      <section id="view-dashboard" class="view">
-        <div class="metric-band" id="dashboard-metrics"></div>
-        <div class="two-column">
-          <section class="surface"><div class="section-head"><div><h2>最近项目</h2><p>按创建顺序展示</p></div><button class="link-button" data-go="projects">查看全部</button></div><div id="recent-projects"></div></section>
-          <section class="surface"><div class="section-head"><div><h2>本月考勤</h2><p>截至今日的成员月度汇总</p></div><button class="link-button" data-go="attendance">进入考勤</button></div><div id="attendance-overview" class="attendance-overview"></div></section>
-        </div>
-        <section class="surface quick-start"><div><h2>从今天开始记录</h2><p>先创建成员与项目，再按日添加工作内容。未做特殊说明的法定工作日会自动视为正常出勤。</p></div><div><button class="secondary" data-go="members">管理成员</button><button class="primary" data-go="projects">记录进展</button></div></section>
-      </section>
 
       <section id="view-members" class="view hidden">
         <div class="toolbar"><div class="search-wrap"><input id="member-search" placeholder="搜索姓名或岗位" /></div><div class="toolbar-note">点击成员行查看项目明细</div></div>
@@ -55,11 +41,16 @@
 
       <section id="view-projects" class="view hidden">
         <div class="metric-band compact" id="project-metrics"></div>
-        <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="project-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" />结束</label><input id="project-search" placeholder="搜索项目名称、ID或进展" /></div><div class="toolbar-group"><label>进程表</label><input type="date" id="timeline-start" /><span>至</span><input type="date" id="timeline-end" /></div></div>
-        <section class="surface table-surface"><table><thead><tr><th>项目名称</th><th>状态</th><th>参与成员</th><th>最新记录</th><th>最近更新</th><th>操作</th></tr></thead><tbody id="projects-body"></tbody></table><div id="projects-empty" class="empty hidden">还没有项目，点击右上角创建</div></section>
-        <section class="surface timeline-section"><div class="section-head"><div><h2>项目进程</h2><p>横向查看每天由谁完成了什么工作</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
-        <section class="surface timeline-section"><div class="section-head"><div><h2>项目总结</h2><p>按进程表时间范围查看每日总结，点击方框可生成、查看或修改</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
+        <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="project-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" />结束</label><input id="project-search" placeholder="搜索项目名称、ID或进展" /></div></div>
+        <section class="surface table-surface"><table><thead><tr><th>项目名称</th><th>状态</th><th>任务进度</th><th>参与成员</th><th>最新记录</th><th>最近更新</th><th>操作</th></tr></thead><tbody id="projects-body"></tbody></table><div id="projects-empty" class="empty hidden">还没有项目，点击右上角创建</div></section>
       </section>
+      <section id="view-project-records" class="view hidden">
+        <div class="toolbar project-toolbar"><div class="toolbar-group"><label for="timeline-start">日期范围</label><input type="date" id="timeline-start" /><span>至</span><input type="date" id="timeline-end" aria-label="结束日期" /></div></div>
+        <section class="surface timeline-section"><div class="section-head"><div><h2>每日总结</h2><p>按进程表时间范围查看每日总结，点击方框可生成、查看或修改</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
+        <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="record-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" />结束</label><input id="record-search" placeholder="搜索项目名称、ID或进展" /></div></div>
+        <section class="surface timeline-section progress-panel"><div class="section-head"><div><h2>项目进程</h2><p>按日期查看工作记录，点击可关联任务与配置完成状态</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
+      </section>
+      <section id="view-project-detail" class="view hidden"><div id="project-detail-content"></div></section>
       <section id="view-todos" class="view hidden">
         <div class="todo-notice" id="todo-push-notice" role="status"></div>
         <div class="toolbar todo-toolbar">
@@ -79,7 +70,7 @@
   <div id="drawer-backdrop" class="backdrop hidden"></div>
   <aside id="detail-drawer" class="drawer hidden"><div id="drawer-content"></div></aside>
   <div id="modal-backdrop" class="backdrop hidden"></div>
-  <div id="modal" class="modal hidden" role="dialog" aria-modal="true"><form id="modal-form"><div class="modal-head"><div><h2 id="modal-title"></h2><p id="modal-description"></p></div><button type="button" class="icon-button" data-close-modal>×</button></div><div id="modal-fields" class="form-grid"></div><div class="modal-actions"><button type="button" class="secondary" data-close-modal>取消</button><button type="submit" class="primary">保存</button></div></form></div>
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title"><form id="modal-form"><div class="modal-head"><div><h2 id="modal-title"></h2><p id="modal-description"></p></div><button type="button" class="icon-button" data-close-modal aria-label="关闭弹窗">×</button></div><div id="modal-fields" class="form-grid"></div><div class="modal-actions"><button type="button" class="secondary" data-close-modal>取消</button><button type="submit" class="primary">保存</button></div></form></div>
   <div id="confirm-backdrop" class="backdrop confirm-layer hidden"></div>
   <div id="confirm-modal" class="confirm-modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message"><h2 id="confirm-title">确认删除</h2><p id="confirm-message"></p><div class="confirm-actions"><button type="button" class="secondary" id="confirm-cancel">取消</button><button type="button" class="danger-button" id="confirm-submit">确认删除</button></div></div>
   <script type="module" src="./app.js"></script>

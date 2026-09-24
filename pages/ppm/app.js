@@ -1,3 +1,4 @@
+import { progressMeter, logTaskLabel, taskOverview } from "./tasks.js";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"})[c]);
@@ -7,19 +8,19 @@ const monthIso = d => iso(d).slice(0, 7);
 const fmt = value => value ? new Date(value).toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—";
 const statusClass = value => `status status-${esc(value)}`;
 
-const state = {view:"dashboard", members:[], projects:[], todos:[], todoPushConfigured:false, attendance:null, summary:null, timeline:null, summaryTimeline:null, dashboard:null, selectedProject:null, summaryPreview:null};
+const state = {view:"projects", members:[], projects:[], todos:[], todoPushConfigured:false, attendance:null, summary:null, timeline:null, summaryTimeline:null, selectedProject:null, summaryPreview:null, projectLogRange:null, detailTab:"overview", taskFilter:"all", taskKeyword:"", expandedTasks:new Set()};
 const bridge = window.AstrBotPluginPage;
 const api = bridge ? {
   get: (endpoint, params) => bridge.apiGet(endpoint, params),
   post: (endpoint, body) => bridge.apiPost(endpoint, body),
 } : createDemoApi();
 
-const settings = {company_name:"我的团队", week_start:"monday"};
+const settings = {week_start:"monday",ui_color_theme:"forest"};
 if (bridge) {
   await bridge.ready();
   Object.assign(settings, (await api.get("health")).settings || {});
 }
-$(".sidebar-footer small").textContent = settings.company_name;
+document.documentElement.dataset.colorTheme = ["forest","ocean","violet","amber"].includes(settings.ui_color_theme) ? settings.ui_color_theme : "forest";
 $("#today-label").textContent = today.toLocaleDateString("zh-CN", {year:"numeric",month:"long",day:"numeric",weekday:"short"});
 $("#attendance-month").value = monthIso(today);
 $("#timeline-end").value = iso(today);
@@ -27,10 +28,11 @@ const weekAgo = new Date(today); weekAgo.setDate(weekAgo.getDate() - 6);
 $("#timeline-start").value = iso(weekAgo);
 
 const viewMeta = {
-  dashboard:["工作台","团队项目与考勤概览","新建项目"],
+  "project-detail":["项目详情","全部项目档案，包含已结束项目","新增工作记录"],
   members:["团队成员","成员档案、项目参与及出勤统计","新增成员"],
   attendance:["考勤管理","公司日历、成员考勤与周期汇总","登记考勤"],
-  projects:["项目管理","状态、成员变动、每日进展与 AI 日报","新建项目"],
+  projects:["项目列表","每一步有迹可循，让进度清晰可见","新建项目"],
+  "project-records":["项目记录","每日总结与项目工作进程","生成每日总结"],
   todos:["待办事项","关联项目，设置一次性或周期提醒","新增待办"],
 };
 
@@ -48,8 +50,15 @@ function toast(message, error = false) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.add("hidden"), 2600);
 }
 
+let navigationVersion = 0;
 async function switchView(view) {
+  navigationVersion++;
+  closeDrawer();
   state.view = view;
+  window.scrollTo(0, 0);
+  $("#primary-action").disabled = false;
+  if (window.matchMedia("(max-width: 640px)").matches) setProjectMenuExpanded(false);
+  if (view !== "project-detail") { const url = new URL(location.href); url.searchParams.set("view", view); url.searchParams.delete("project"); history.replaceState(null, "", url); }
   $$(".view").forEach(el => el.classList.add("hidden"));
   $(`#view-${view}`).classList.remove("hidden");
   $$("#nav button").forEach(el => el.classList.toggle("active", el.dataset.view === view));
@@ -59,11 +68,19 @@ async function switchView(view) {
 }
 
 async function loadView(view) {
+  const version = navigationVersion;
   return withLoading(async () => {
-    if (view === "dashboard") { state.dashboard = await api.get("dashboard"); renderDashboard(); }
+    if (view === "project-detail") {
+      await loadProjects();
+      if (version !== navigationVersion) return;
+      const id = state.projects.find(p => p.id === state.selectedProject?.id)?.id || state.projects[0]?.id;
+      if (id && state.projects.some(p => p.id === id)) await openProject(id);
+      else { state.selectedProject = null; $("#project-detail-content").innerHTML = `<div class="surface empty">暂无项目，请先在项目列表中创建项目</div>`; $("#primary-action").disabled = true; }
+    }
     if (view === "members") { state.members = await api.get("members"); renderMembers(); }
     if (view === "attendance") { await loadAttendance(); }
-    if (view === "projects") { await Promise.all([loadProjects(), loadTimeline(), loadSummaries()]); }
+    if (view === "projects") { await loadProjects(); }
+    if (view === "project-records") { await Promise.all([loadTimeline(), loadSummaries()]); }
     if (view === "todos") { await loadTodos(); }
   });
 }
@@ -118,7 +135,7 @@ function renderTodos() {
 }
 async function todoModal(todo = {}) {
   const projects = await withLoading(() => api.get("projects"));
-  if (!projects.length && !todo.id) { toast("请先在项目管理中创建项目", true); return; }
+  if (!projects.length && !todo.id) { toast("请先在项目列表中创建项目", true); return; }
   if (todo.project_deleted_at) projects.push({id:todo.project_id,name:`${todo.project_name}（已删除）`});
   const projectField = `<label class="field full"><span>所属项目</span><select name="project_id" required><option value="">请选择项目</option>${projects.map(project=>`<option value="${project.id}" ${project.id===todo.project_id ? "selected" : ""}>${esc(project.name)} · #${project.id}</option>`).join("")}</select></label>`;
   const offset = todo.push_mode === "weekly" ? todo.push_utc_offset : -new Date().getTimezoneOffset();
@@ -135,7 +152,7 @@ async function todoModal(todo = {}) {
       const weekdays = form.getAll("push_weekdays").map(Number);
       if (mode === "weekly" && !weekdays.length) { toast("请至少选择一个重复星期",true); return; }
       await withLoading(() => api.post("todos/save", {id:todo.id,project_id:Number(form.get("project_id")),content:form.get("content"),push_enabled:enabled,push_mode:mode,push_at:mode === "once" && at ? new Date(at).toISOString() : null,push_weekdays:weekdays,push_time:form.get("push_time"),push_utc_offset:offset}));
-      closeModal(); toast("待办已保存"); await withLoading(loadTodos);
+      closeModal(); toast("待办已保存"); await withLoading(loadTodos); if(state.view==="project-detail")await openProject(state.selectedProject.id);
     }});
   const content = $('#modal-form [name="content"]'); content.required = true; content.maxLength = 3000;
   const toggle = $('#modal-form [name="push_enabled"]'), mode = $('#modal-form [name="push_mode"]');
@@ -152,15 +169,6 @@ async function todoModal(todo = {}) {
 
 function metric(label, value, note = "") { return `<div class="metric"><label>${esc(label)}</label><strong>${Number(value || 0)}</strong><small>${esc(note)}</small></div>`; }
 
-function renderDashboard() {
-  const data = state.dashboard, metrics = data.metrics || {};
-  $("#dashboard-metrics").innerHTML = metric("全部项目", metrics.total, "持续跟踪") + metric("进行中", metrics.active, "当前执行") + metric("已完成", metrics.finished, "累计完成") + metric("已暂停", metrics.paused, "需要关注");
-  $("#recent-projects").innerHTML = (data.recent_projects || []).map(p => `<div class="list-row" data-project="${p.id}"><strong>${esc(p.name)}</strong><span class="${statusClass(p.status)}">${esc(p.status)}</span><small class="latest-record-date">${esc(p.latest_record_date || "暂无记录")}</small><small>${fmt(p.updated_at)}</small></div>`).join("") || `<div class="empty">暂无项目数据</div>`;
-  const att = data.attendance || {}, total = Number(att.normal||0)+Number(att.overtime||0)+Number(att.time_off||0) || 1;
-  $("#attendance-overview").innerHTML = `<span class="big-number">${Number(att.normal||0)}</span><span> 人日正常出勤（截至今日）</span><div class="overview-bars">${overviewBar("正常",att.normal,total,"#0da66e")}${overviewBar("加班",att.overtime,total,"#d88912")}${overviewBar("调休",att.time_off,total,"#e5484d")}</div>`;
-}
-function overviewBar(label, value, total, color) { return `<div><div class="bar-label"><span>${label}</span><strong>${Number(value||0)}</strong></div><div class="bar"><i style="width:${Math.min(100,Number(value||0)/total*100)}%;background:${color}"></i></div></div>`; }
-
 function renderMembers() {
   const keyword = $("#member-search").value.trim().toLowerCase();
   const items = state.members.filter(m => [m.name,m.role].join(" ").toLowerCase().includes(keyword));
@@ -168,14 +176,24 @@ function renderMembers() {
   $("#members-empty").classList.toggle("hidden", items.length > 0);
 }
 
-async function loadProjects() { state.projects = await api.get("projects"); renderProjects(); }
+async function loadProjects() { state.projects = await api.get("projects"); renderProjects(); renderProjectMenu(); }
+function setProjectMenuExpanded(expanded) {
+  $("#project-submenu").classList.toggle("expanded", expanded);
+  $('#nav [data-view="project-detail"]').setAttribute("aria-expanded", String(expanded));
+}
+window.matchMedia("(max-width: 640px)").addEventListener("change", event => {
+  if (event.matches) setProjectMenuExpanded(false);
+});
+function renderProjectMenu() {
+  $("#project-submenu").innerHTML = state.projects.map(p => `<button data-view-project="${p.id}" class="${state.view === "project-detail" && state.selectedProject?.id === p.id ? "active" : ""}" title="${esc(p.name)} · ${esc(p.status)}"><span class="project-nav-name">${esc(p.name)}</span><small>${esc(p.status)}</small></button>`).join("") || `<p class="muted-note">暂无项目</p>`;
+}
 function renderProjects() {
-  const counts = Object.fromEntries(["准备","进行","维护","暂停","结束"].map(s => [s,state.projects.filter(p=>p.status===s).length]));
-  $("#project-metrics").innerHTML = ["准备","进行","维护","暂停","结束"].map(s=>metric(s,counts[s],s==="进行"?"正在执行":"项目状态")).join("");
+  const tasks = state.projects.reduce((n,p)=>n+(p.task_count||0),0), completed = state.projects.reduce((n,p)=>n+(p.completed_task_count||0),0);
+  $("#project-metrics").innerHTML = metric("项目总数",state.projects.length,"全部项目档案")+metric("进行中的项目",state.projects.filter(p=>p.status==="进行").length,"持续推进")+metric("未完成任务",tasks-completed,"下一步行动")+metric("已完成任务",completed,`共 ${tasks} 项任务`);
   const keyword = $("#project-search").value.trim().toLowerCase();
   const statuses = new Set($$("#project-status-filter input:checked").map(input => input.value));
   const items = state.projects.filter(p => statuses.has(p.status) && [p.id,p.name,p.description,p.latest_record_date].join(" ").toLowerCase().includes(keyword));
-  $("#projects-body").innerHTML = items.map(p => `<tr data-project="${p.id}"><td><div class="project-cell"><strong>${esc(p.name)}</strong><small>项目ID：${esc(p.id)}</small></div></td><td><span class="${statusClass(p.status)}">${esc(p.status)}</span></td><td>${memberStack(p.members)}</td><td>${esc(p.latest_record_date || "暂无记录")}</td><td>${fmt(p.updated_at)}</td><td><div class="actions"><button class="text-action" data-view-project="${p.id}">查看</button><button class="text-action" data-edit-project="${p.id}">编辑</button><button class="text-action danger" data-delete-project="${p.id}">删除</button></div></td></tr>`).join("");
+  $("#projects-body").innerHTML = items.map(p => `<tr data-project="${p.id}"><td><div class="project-cell"><strong>${esc(p.name)}</strong><small>项目ID：${esc(p.id)}</small></div></td><td><span class="${statusClass(p.status)}">${esc(p.status)}</span></td><td>${progressMeter(p)}</td><td>${memberStack(p.members)}</td><td>${esc(p.latest_record_date || "暂无记录")}</td><td>${fmt(p.updated_at)}</td><td><div class="actions"><button class="text-action" data-view-project="${p.id}">详情</button><button class="text-action" data-add-log-for-project="${p.id}">记一笔</button><button class="text-action danger" data-delete-project="${p.id}">删除</button></div></td></tr>`).join("");
   $("#projects-empty").classList.toggle("hidden", items.length > 0);
 }
 function memberStack(members = []) { return `<div class="member-stack">${members.slice(0,4).map(m=>`<span class="mini-avatar" title="${esc(m.name)}">${esc(m.name.slice(0,1))}</span>`).join("")}${members.length>4?`<span class="mini-avatar">+${members.length-4}</span>`:""}${!members.length?"—":""}</div>`; }
@@ -200,11 +218,12 @@ async function loadTimeline() {
 }
 function renderTimeline() {
   const t = state.timeline;
-  const statuses = new Set($$("#project-status-filter input:checked").map(input => input.value));
-  const projects = (t?.projects||[]).filter(project=>statuses.has(project.status));
+  const statuses = new Set($$("#record-status-filter input:checked").map(input => input.value));
+  const keyword = $("#record-search").value.trim().toLowerCase();
+  const projects = (t?.projects||[]).filter(project=>statuses.has(project.status) && [project.id,project.name,project.description,project.latest_record_date].join(" ").toLowerCase().includes(keyword));
   if (!t || !projects.length) { $("#timeline").innerHTML = `<div class="empty">当前筛选条件下暂无项目进程</div>`; return; }
   const head = t.dates.map(d=>`<th>${esc(d.slice(5))}<small style="display:block;color:#8b95a6">${"日一二三四五六"[new Date(d+"T00:00:00").getDay()]}</small></th>`).join("");
-  const rows = projects.map(p=>`<tr><td><strong>${esc(p.name)}</strong></td>${t.dates.map(d=>{const logs=t.logs[`${p.id}:${d}`]||[];return `<td><button class="timeline-cell ${logs.length?"has-log":""}" data-log-project="${p.id}" data-log-date="${d}" title="${esc(logs.map(l=>l.content).join("\n"))}">${logs.length?`${logs.length} 条记录`:"—"}</button></td>`}).join("")}</tr>`).join("");
+  const rows = projects.map(p=>`<tr><td><strong>${esc(p.name)}</strong></td>${t.dates.map(d=>{const logs=t.logs[`${p.id}:${d}`]||[];return `<td><button class="timeline-cell ${logs.length?"has-log":""}" data-log-project="${p.id}" data-log-date="${d}" title="${esc(logs.map(l=>`${l.task_name||"项目级记录"}：${l.content}`).join("\n"))}">${logs.length?`${logs.length} 条记录`:"—"}</button></td>`}).join("")}</tr>`).join("");
   $("#timeline").innerHTML = `<table class="timeline-table"><thead><tr><th>项目名称</th>${head}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -241,11 +260,14 @@ function renderAttendance() {
   $("#attendance-details").innerHTML = `<h3 style="margin-top:0">加班 / 调休明细</h3>` + (state.summary.details.map(r=>`<div class="detail-line"><time>${esc(r.work_date.slice(5))}</time><strong>${esc(r.name)}</strong><span class="${r.status==="加班"?"status status-维护":"status status-暂停"}">${esc(r.status)} ${Number(r.hours||0)}h</span><span>${esc(r.note||"")}</span></div>`).join("") || `<p style="color:var(--muted)">当前周期暂无异常记录</p>`);
 }
 
+let modalReturnFocus = null;
 function openModal({title,description="",fields,onSubmit}) {
+  if($("#modal").classList.contains("hidden")) modalReturnFocus=document.activeElement;
   $("#modal-title").textContent=title; $("#modal-description").textContent=description; $("#modal-fields").innerHTML=fields;
   $(".modal-actions").classList.remove("hidden");
   $("#modal-form button[type=submit]").textContent="保存";
   $("#modal").classList.remove("hidden"); $("#modal-backdrop").classList.remove("hidden");
+  requestAnimationFrame(()=>($("#modal-fields input:not([disabled]), #modal-fields select:not([disabled]), #modal-fields textarea:not([disabled])") || $("#modal [data-close-modal]"))?.focus({preventScroll:true}));
   $("#modal-form").onsubmit = async event => {
     event.preventDefault();
     const form = event.currentTarget, button = $("button[type=submit]", form);
@@ -256,7 +278,7 @@ function openModal({title,description="",fields,onSubmit}) {
     finally { button.disabled = false; }
   };
 }
-function closeModal() { $("#modal").classList.add("hidden"); $("#modal-backdrop").classList.add("hidden"); }
+function closeModal() { $("#modal").classList.add("hidden"); $("#modal-backdrop").classList.add("hidden"); if(modalReturnFocus?.isConnected)modalReturnFocus.focus({preventScroll:true}); }
 let confirmResolver = null;
 function confirmAction(message) {
   if (confirmResolver) confirmResolver(false);
@@ -304,50 +326,118 @@ async function projectModal(project = {}) {
   const memberChecks = `<div class="field full"><label>参与成员</label><div class="checkbox-grid">${state.members.map(m=>`<label class="check-item"><input type="checkbox" name="member_ids" value="${m.id}" ${selected.has(Number(m.id))?"checked":""}/><span>${esc(m.name)}</span></label>`).join("")||"<span>请先创建成员</span>"}</div></div>`;
   openModal({title:project.id?"编辑项目":"新建项目",description:"状态和参与成员的每一次变化都会被记录。",fields:field("项目名称","name",project.name,"text",false,true)+selectField("当前状态","status",["准备","进行","维护","暂停","结束"],project.status||"准备")+field("开始日期","start_date",project.start_date,"date")+field("计划结束","end_date",project.end_date,"date")+textarea("项目描述","description",project.description)+memberChecks+textarea("状态变更说明","status_note",""),onSubmit:async form=>{
     const payload={id:project.id,name:form.get("name"),status:form.get("status"),start_date:form.get("start_date"),end_date:form.get("end_date"),description:form.get("description"),status_note:form.get("status_note"),member_ids:form.getAll("member_ids").map(Number)};
-    await withLoading(()=>api.post("projects/save",payload)); closeModal(); toast("项目已保存"); await loadView("projects");
+    await withLoading(()=>api.post("projects/save",payload)); closeModal(); toast("项目已保存"); await loadProjects(); if (state.view === "project-detail" && project.id) await openProject(project.id); else await loadView("projects");
   }});
 }
 
-function workLogModal(projectId, workDate=iso(today), record={}) {
-  openModal({title:record.id?"编辑当天记录":"新增当天记录",description:"只记录日期和实际工作内容。",fields:field("日期","work_date",record.work_date||workDate,"date",false,true)+textarea("工作内容","content",record.content||"",true,"work-log-content"),onSubmit:async form=>{
-    const date=form.get("work_date");
-    await withLoading(()=>api.post("worklogs/save",{id:record.id,project_id:projectId,work_date:date,content:form.get("content")})); closeModal(); toast(record.id?"记录已更新":"记录已新增"); await Promise.all([loadProjects(),loadTimeline()]); await openDayLogs(projectId,date);
-  }});
+async function workLogModal(projectId, workDate=iso(today), record={}) {
+  const tasks = await withLoading(()=>api.get("tasks",{project_id:projectId}));
+  const choices = tasks.filter(t=>!t.deleted_at || t.id===record.task_id);
+  openModal({title:record.id?"编辑工作记录":"新增工作记录",description:"记录可以关联一项任务。完成操作与本次记录一起保存；删除或修改记录不会自动撤销任务状态。",
+    fields:field("记录日期","work_date",record.work_date||workDate,"date",false,true)+
+    `<label class="field"><span>关联任务</span><select name="task_id"><option value="">项目级记录（不关联任务）</option>${choices.map(t=>`<option value="${t.id}" ${t.id===record.task_id?"selected":""}>${esc(t.name)} · ${t.deleted_at?"已删除":t.status}</option>`).join("")}</select></label>`+
+    `<label class="field full"><span>保存时的任务状态</span><select name="task_action"><option value="keep">保持当前状态</option><option value="complete">标记为完成（完成日期使用记录日期）</option><option value="reopen">重新打开（保留之前的完成历史）</option></select></label>`+
+    textarea("工作内容","content",record.content||"",true,"work-log-content"),onSubmit:async form=>{
+      const date=form.get("work_date");
+      await withLoading(()=>api.post("worklogs/save",{id:record.id,project_id:projectId,work_date:date,content:form.get("content"),task_id:form.get("task_id")?Number(form.get("task_id")):null,task_action:form.get("task_action")||"keep"}));
+      closeModal(); toast(record.id?"记录已更新":"记录已新增"); await Promise.all([loadProjects(),loadTimeline()]); if (state.view === "project-detail") await openProject(projectId); else await openDayLogs(projectId,date);
+    }});
+  const select = $('[name="task_id"]',$("#modal-form")), action = $('[name="task_action"]',$("#modal-form"));
+  const update = ()=>{action.disabled=!select.value || Boolean(tasks.find(t=>t.id===Number(select.value))?.deleted_at); if(action.disabled) action.value="keep";};
+  select.onchange=update; update();
+  $('[name="content"]',$("#modal-form")).required=true;
+  $('[name="content"]',$("#modal-form")).maxLength=4000;
+}
+
+function taskModal(task = {}) {
+  openModal({title:task.id?"编辑任务":"新增任务",description:"完成进度由任务数量计算。每次完成、重新打开和日期修改都会保留历史。",
+    fields:field("任务名称","name",task.name,"text",true,true)+field("开始日期","start_date",task.start_date||iso(today),"date",false,true)+selectField("任务状态","status",["未完成","完成"],task.status||"未完成")+field("完成日期","completed_date",task.completed_date||iso(today),"date")+textarea("任务说明","description",task.description),
+    onSubmit:async form=>{
+      await withLoading(()=>api.post("tasks/save",{id:task.id,project_id:state.selectedProject.id,name:form.get("name"),description:form.get("description"),start_date:form.get("start_date"),status:form.get("status"),completed_date:form.get("status")==="完成"?form.get("completed_date"):null}));
+      closeModal(); toast("任务已保存"); await loadProjects(); await openProject(state.selectedProject.id);
+    }});
+  const status=$('[name="status"]',$("#modal-form")), completed=$('[name="completed_date"]',$("#modal-form"));
+  completed.max=iso(new Date());
+  const update=()=>{completed.disabled=status.value!=="完成";completed.required=!completed.disabled;completed.closest(".field").classList.toggle("hidden",completed.disabled);};
+  status.onchange=update;update();
+  $('[name="name"]',$("#modal-form")).maxLength=120;
 }
 
 async function openDayLogs(projectId, workDate) {
   const detail=await withLoading(()=>api.get("worklogs",{project_id:projectId,date:workDate}));
-  const rows=(detail.logs||[]).map(log=>`<div class="day-log-item"><label class="field full"><span>工作内容</span><textarea class="work-log-content day-log-content" readonly>${esc(log.content)}</textarea></label><div class="day-log-footer"><small>记录日期：${esc(log.work_date)}</small><div class="actions"><button type="button" class="text-action" data-edit-day-log="${log.id}">编辑</button><button type="button" class="text-action danger" data-delete-day-log="${log.id}">删除</button></div></div></div>`).join("")||`<div class="empty">当天暂无记录</div>`;
+  const rows=(detail.logs||[]).map(log=>`<div class="day-log-item"><label class="field full"><span>${logTaskLabel(log)}</span><textarea class="work-log-content day-log-content" readonly>${esc(log.content)}</textarea></label><div class="day-log-footer"><small>记录日期：${esc(log.work_date)}</small><div class="actions"><button type="button" class="text-action" data-edit-day-log="${log.id}">编辑</button><button type="button" class="text-action danger" data-delete-day-log="${log.id}">删除</button></div></div></div>`).join("")||`<div class="empty">当天暂无记录</div>`;
   openModal({title:`${detail.project.name} · ${workDate}`,description:"查看并维护该项目当天的全部工作记录。",fields:`<div class="field full"><div class="section-head compact-head"><h3>当天记录</h3><button type="button" class="primary" data-add-day-log>新增记录</button></div><div id="day-log-list">${rows}</div></div>`,onSubmit:async()=>{}});
   state.dayLogs={projectId:Number(projectId),workDate,logs:detail.logs||[]};
   $(".modal-actions").classList.add("hidden");
 }
 
 async function openProject(id) {
-  const detail = await withLoading(()=>api.get("projects/detail",{id})); state.selectedProject=detail;
-  $("#drawer-content").innerHTML = `<div class="drawer-head"><div><h2>${esc(detail.name)}</h2><span class="${statusClass(detail.status)}">${esc(detail.status)}</span></div><button class="icon-button" data-close-drawer>×</button></div><div class="drawer-body project-detail-body">
-    <div class="detail-section"><h3>项目信息</h3><dl class="definition-list"><dt>项目ID</dt><dd>${esc(detail.id)}</dd><dt>项目描述</dt><dd>${esc(detail.description||"—")}</dd><dt>计划周期</dt><dd>${esc(detail.start_date||"—")} 至 ${esc(detail.end_date||"—")}</dd><dt>创建时间</dt><dd>${fmt(detail.created_at)}</dd></dl></div>
-    <div class="detail-section"><div class="section-head compact-head"><h3>状态变更历史</h3><button class="primary" data-add-status-history>新增状态记录</button></div>${detail.status_history.map(h=>`<div class="history-item"><div><strong>${esc(h.from_status?`${h.from_status} → ${h.to_status}`:`创建为 ${h.to_status}`)}</strong><small>${fmt(h.changed_at)}${h.note?` · ${esc(h.note)}`:""}</small></div><div class="actions"><button class="text-action" data-edit-status-history="${h.id}">编辑</button><button class="text-action danger" data-delete-status-history="${h.id}">删除</button></div></div>`).join("")||"<p style='color:var(--muted)'>暂无状态记录</p>"}</div>
-    <div class="detail-section"><div class="section-head compact-head"><h3>成员变更历史</h3><button class="primary" data-add-membership-history>新增成员记录</button></div>${detail.membership_history.map(h=>`<div class="history-item"><div><strong>${esc(h.name)} · ${h.left_at?"已退出":"参与中"}</strong><small>${esc(h.joined_at)} 加入${h.left_at?`，${esc(h.left_at)} 退出`:""}</small></div><div class="actions"><button class="text-action" data-edit-membership-history="${h.id}">编辑</button><button class="text-action danger" data-delete-membership-history="${h.id}">删除</button></div></div>`).join("")||"<p style='color:var(--muted)'>暂无成员记录</p>"}</div>
-  </div>`;
-  $("#detail-drawer").classList.remove("hidden"); $("#drawer-backdrop").classList.remove("hidden");
-  $(".project-detail-body").insertAdjacentHTML("afterbegin",`<div class="detail-section"><div class="section-head compact-head"><h3>项目全生命周期总结</h3><button class="primary" data-project-summary="${detail.id}">生成项目总结</button></div></div>`);
+  const version = ++navigationVersion;
+  const [detail, todoData] = await withLoading(()=>Promise.all([api.get("projects/detail",{id}),api.get("todos")]));
+  if (version !== navigationVersion) return;
+  const changingProject = state.view !== "project-detail" || state.selectedProject?.id !== detail.id;
+  if (changingProject) { window.scrollTo(0, 0); state.projectLogRange = {start:"",end:""}; state.detailTab="overview"; state.taskFilter="all"; state.taskKeyword=""; state.expandedTasks=new Set(); }
+  state.selectedProject=detail; state.todos=todoData.todos; state.todoPushConfigured=todoData.push_configured;
+  closeDrawer();
+  state.view = "project-detail";
+  $$(".view").forEach(el => el.classList.toggle("hidden", el.id !== "view-project-detail"));
+  $$("#nav > button").forEach(el => el.classList.toggle("active", el.dataset.view === "project-detail"));
+  if (changingProject || window.matchMedia("(max-width: 640px)").matches) setProjectMenuExpanded(!window.matchMedia("(max-width: 640px)").matches);
+  $("#page-title").textContent = detail.name;
+  $("#page-subtitle").textContent = "任务、记录与项目全生命周期";
+  $("#primary-action").textContent = "新增工作记录";
+  $("#primary-action").disabled = false;
+  const url = new URL(location.href); url.searchParams.set("view", "project-detail"); url.searchParams.set("project", id); history.replaceState(null, "", url);
+  renderProjectMenu();
+  renderProjectDetail();
 }
-function projectSummaryModal(projectId) {
-  let generating=false;
-  openModal({title:"项目全生命周期总结",description:`项目ID：${projectId} · 根据全部状态历史和工作记录生成，结果仅供查看，不保存到每日总结。`,fields:`<label class="field full"><span>总结内容</span><textarea class="summary-content-editor" data-lifecycle-result readonly placeholder="点击生成，查看项目各阶段总结"></textarea></label>`,onSubmit:async (_,form)=>{
-    if(generating)return;
-    generating=true;
-    const output=$("[data-lifecycle-result]",form);
-    const submit=$("button[type=submit]",form);
-    try {
-      const result=await withGenerating(form,()=>withLoading(()=>api.post("ai/project-summary",{project_id:projectId})));
-      output.value=result.content;
-      if(output.isConnected)submit.textContent="重新生成";
-    } finally { generating=false; }
-  }});
-  $("#modal-form button[type=submit]").textContent="生成项目总结";
+function renderProjectDetail() {
+  const detail = state.selectedProject;
+  $("#page-subtitle").textContent = detail.description || "任务、记录与项目全生命周期";
+  $("#project-detail-content").innerHTML = `
+    <div class="detail-command"><button class="text-action" data-go="projects">项目列表 /</button><span class="${statusClass(detail.status)}">${esc(detail.status)}</span><span class="command-spacer"></span><button class="secondary" data-edit-project="${detail.id}">编辑项目</button></div>
+    <section class="project-summary-band">${progressMeter(detail,true)}<div class="summary-fact"><small>开始日期</small><strong>${esc(detail.start_date||"未设置")}</strong></div><div class="summary-fact"><small>工作记录</small><strong>${detail.work_logs.length}</strong></div><div class="summary-fact"><small>项目成员</small><strong>${esc(detail.membership_history.filter(m=>!m.left_at).map(m=>m.name).join("、")||"暂无成员")}</strong></div></section>
+    <nav class="detail-tabs" aria-label="项目详情视图">${[["overview","总览与任务"],["logs","工作记录"],["archive","项目档案"]].map(([id,label])=>`<button data-detail-tab="${id}" class="${state.detailTab===id?"active":""}" aria-pressed="${state.detailTab===id}">${label}</button>`).join("")}</nav>
+    <div id="detail-tab-content"></div>`;
+  renderDetailTab();
 }
+function renderDetailTab() {
+  const detail=state.selectedProject, target=$("#detail-tab-content");
+  $$("[data-detail-tab]").forEach(b=>{b.classList.toggle("active",b.dataset.detailTab===state.detailTab);b.setAttribute("aria-pressed",String(b.dataset.detailTab===state.detailTab));});
+  if(state.detailTab==="overview") { target.innerHTML=taskOverview(detail,state.taskFilter,state.taskKeyword,state.expandedTasks); return; }
+  if(state.detailTab==="logs") {
+    target.innerHTML=`<section class="surface journal-panel"><div class="section-head"><div><h2 id="project-log-heading">工作记录</h2><p>按任务筛选，回看项目每一步</p></div><button class="primary" data-add-project-log>新增记录</button></div><div class="project-log-range"><label>开始日期<input type="date" id="project-log-start" value="${state.projectLogRange.start}" /></label><label>结束日期<input type="date" id="project-log-end" value="${state.projectLogRange.end}" /></label><label>关联任务<select id="project-log-task"><option value="">全部任务与记录</option><option value="none">项目级记录</option>${(detail.tasks||[]).map(t=>`<option value="${t.id}">${esc(t.name)}${t.deleted_at?"（已删除）":""}</option>`).join("")}</select></label><button class="secondary" data-all-project-logs>全部时间</button><button class="secondary" data-recent-project-logs>最近一周</button></div><div id="project-log-list"></div></section>`;
+    renderProjectLogs(); return;
+  }
+  target.innerHTML=`<section class="surface"><div class="section-head"><h2>项目档案</h2></div><dl class="project-info-grid"><div><dt>项目 ID</dt><dd>#${detail.id}</dd></div><div><dt>计划周期</dt><dd>${esc(detail.start_date||"未设置")} — ${esc(detail.end_date||"未设置")}</dd></div><div><dt>创建时间</dt><dd>${fmt(detail.created_at)}</dd></div><div><dt>最近更新</dt><dd>${fmt(detail.updated_at)}</dd></div><div class="project-description"><dt>项目描述</dt><dd>${esc(detail.description||"暂无描述")}</dd></div></dl></section><div class="archive-columns">
+    <section class="surface"><div class="section-head"><h2>状态变更</h2><button class="secondary" data-add-status-history>新增状态记录</button></div><div class="archive-content">${detail.status_history.map(h=>`<div class="history-item"><div><strong>${esc(h.from_status?`${h.from_status} → ${h.to_status}`:`创建为 ${h.to_status}`)}</strong><small>${fmt(h.changed_at)} · ${esc(h.note)}</small></div><div class="actions"><button class="text-action" data-edit-status-history="${h.id}">编辑</button><button class="text-action danger" data-delete-status-history="${h.id}">删除</button></div></div>`).join("")}</div></section>
+    <section class="surface"><div class="section-head"><h2>成员变更</h2><button class="secondary" data-add-membership-history>新增成员记录</button></div><div class="archive-content">${detail.membership_history.map(h=>`<div class="history-item"><div><strong>${esc(h.name)} · ${h.left_at?"已退出":"参与中"}</strong><small>${esc(h.joined_at)} 加入${h.left_at?`，${esc(h.left_at)} 退出`:""}</small><small>${esc(h.join_reason||"—")} · ${esc(h.leave_reason||"—")}</small></div><div class="actions"><button class="text-action" data-edit-membership-history="${h.id}">编辑</button><button class="text-action danger" data-delete-membership-history="${h.id}">删除</button></div></div>`).join("")||`<div class="empty">暂无成员记录</div>`}</div></section></div>
+    <section class="surface"><div class="section-head"><h2>关联待办</h2><button class="secondary" data-add-project-todo>新增待办</button></div><div class="archive-content">${state.todos.filter(t=>t.project_id===detail.id).map(t=>`<article class="log-card"><p>${esc(t.content)}</p><small>${esc(todoPushLabel(t))} · ${esc(todoScheduleLabel(t))}</small><div class="actions"><button class="text-action" data-edit-todo="${t.id}">编辑</button><button class="text-action danger" data-delete-todo="${t.id}">删除</button></div></article>`).join("")||`<div class="empty">暂无关联待办</div>`}</div></section>`;
+}
+
+function recentProjectLogRange() {
+  const end = new Date(), start = new Date(end); start.setDate(start.getDate() - 6);
+  return {start:iso(start), end:iso(end)};
+}
+function renderProjectLogs() {
+  const {start,end} = state.projectLogRange;
+  const task = $("#project-log-task")?.value || "";
+  const logs = (state.selectedProject.work_logs||[]).filter(log=>(!start || log.work_date>=start) && (!end || log.work_date<=end) && (!task || (task==="none" ? !log.task_id : log.task_id===Number(task))));
+  $("#project-log-heading").textContent = `每日记录 · ${logs.length} 条`;
+  $("#project-log-list").innerHTML = logs.map(log=>`<article class="log-card"><div class="section-head compact-head"><strong>${esc(log.work_date)} ${logTaskLabel(log)}</strong><div class="actions"><button class="text-action" data-edit-project-log="${log.id}">编辑</button><button class="text-action danger" data-delete-project-log="${log.id}">删除</button></div></div><p>${esc(log.content)}</p><small>更新于 ${fmt(log.updated_at||log.created_at)}</small></article>`).join("") || `<div class="empty">所选时间区间暂无记录</div>`;
+}
+document.addEventListener("change", event => {
+  if (!event.target.matches("#project-log-start, #project-log-end")) return;
+  const start = $("#project-log-start").value, end = $("#project-log-end").value;
+  if (start && end && start > end) {
+    toast("开始日期不能晚于结束日期", true);
+    $("#project-log-start").value = state.projectLogRange.start;
+    $("#project-log-end").value = state.projectLogRange.end;
+    return;
+  }
+  state.projectLogRange = {start,end}; renderProjectLogs();
+});
+
 function closeDrawer(){ $("#detail-drawer").classList.add("hidden"); $("#drawer-backdrop").classList.add("hidden"); }
 
 function localDateTime(value) {
@@ -376,18 +466,18 @@ async function membershipHistoryModal(history={}) {
 async function generateSummaryModal(summaryDate) {
   const datedProjects=await withLoading(()=>api.get("projects",{summary_date:summaryDate}));
   const savedSummary=summaryByDate(summaryDate);
-  const selectableProjects=datedProjects.filter(project=>project.status!=="结束"||project.has_records);
-  const selected = new Set(selectableProjects.filter(project=>project.has_records).map(project=>project.id));
-  const checks = `<div class="field full"><label>选择项目（默认勾选当天有记录的项目）</label><div class="checkbox-grid">${selectableProjects.map(project=>`<label class="check-item"><input type="checkbox" name="project_ids" value="${project.id}" ${selected.has(project.id)?"checked":""} /><span>${esc(project.name)} · ${esc(project.status)}</span></label>`).join("")||`<span class="muted-note">没有可选项目</span>`}</div></div>`;
+  const selectableProjects=datedProjects.filter(project=>project.status!=="结束"||project.has_records||project.has_task_changes);
+  const selected = new Set(selectableProjects.filter(project=>project.has_records||project.has_task_changes).map(project=>project.id));
+  const checks = `<div class="field full"><label>选择项目（默认勾选当天有记录或任务变更的项目）</label><div class="checkbox-grid">${selectableProjects.map(project=>`<label class="check-item"><input type="checkbox" name="project_ids" value="${project.id}" ${selected.has(project.id)?"checked":""} /><span>${esc(project.name)} · ${esc(project.status)}</span></label>`).join("")||`<span class="muted-note">没有可选项目</span>`}</div></div>`;
   const overwrite = savedSummary ? `<label class="check-item field full overwrite-option"><input type="checkbox" name="overwrite" /><span>覆盖该日已保存的总结；不勾选时仅生成预览</span></label>` : "";
-  openModal({title:savedSummary?"重新生成项目总结":"生成项目总结",description:"默认选择所选日期有工作记录的项目，包括当天有记录的结束项目；可手动调整。",fields:`<div class="field"><span>总结日期</span><strong class="readonly-value">${esc(summaryDate)}</strong></div>`+field("附带前几天总结","history_days",1,"number",false,true)+checks+overwrite+`<div id="team-summary-result" class="field full"></div>`,onSubmit:async (form,formElement)=>{
+  openModal({title:savedSummary?"重新生成每日总结":"生成每日总结",description:"按任务归纳当天工作，包含项目级记录、当日任务变更与截至当日的进度。默认勾选当天有记录或任务变更的项目，可手动调整。",fields:`<div class="field"><span>总结日期</span><strong class="readonly-value">${esc(summaryDate)}</strong></div>`+field("附带前几天总结","history_days",1,"number",false,true)+checks+overwrite+`<div id="team-summary-result" class="field full"></div>`,onSubmit:async (form,formElement)=>{
     const projectIds=form.getAll("project_ids").map(Number);
     if (!projectIds.length) { toast("请至少选择一个项目",true); return; }
     const historyDays=Number(form.get("history_days"));
     if (!Number.isInteger(historyDays)||historyDays<0||historyDays>30) { toast("附带天数必须是 0 到 30 的整数",true); return; }
     const result=await withGenerating(formElement,()=>withLoading(()=>api.post("ai/summary",{date:summaryDate,project_ids:projectIds,history_days:historyDays,overwrite:form.has("overwrite")})));
     if (result.persisted) {
-      await loadSummaries(); closeModal(); toast(`${summaryDate} 项目总结已保存`); return;
+      await loadSummaries(); closeModal(); toast(`${summaryDate} 每日总结已保存`); return;
     }
     state.summaryPreview=result;
     $("#team-summary-result").innerHTML=`<label>新生成的预览（尚未覆盖）</label><div class="ai-box summary-result">${esc(result.content)}</div><button type="button" class="primary preview-save" data-save-summary-preview>使用此结果覆盖已保存总结</button>`;
@@ -400,7 +490,7 @@ async function generateSummaryModal(summaryDate) {
 function openSummaryDetail(summaryDate) {
   const summary=summaryByDate(summaryDate);
   if (!summary) { generateSummaryModal(summaryDate); return; }
-  openModal({title:`${summaryDate} 项目总结`,description:`${(summary.project_names||[]).join("、")||"全部项目"} · ${fmt(summary.created_at)} 更新`,fields:`<label class="field full"><span>总结内容</span><textarea class="summary-content-editor" name="content">${esc(summary.content)}</textarea></label><div class="field full summary-detail-actions"><button type="button" class="secondary" data-regenerate-summary="${summaryDate}">重新生成</button><button type="button" class="danger-button" data-delete-summary="${summaryDate}">删除总结</button></div>`,onSubmit:async form=>{
+  openModal({title:`${summaryDate} 每日总结`,description:`${(summary.project_names||[]).join("、")||"全部项目"} · ${fmt(summary.created_at)} 更新`,fields:`<label class="field full"><span>总结内容</span><textarea class="summary-content-editor" name="content">${esc(summary.content)}</textarea></label><div class="field full summary-detail-actions"><button type="button" class="secondary" data-regenerate-summary="${summaryDate}">重新生成</button><button type="button" class="danger-button" data-delete-summary="${summaryDate}">删除总结</button></div>`,onSubmit:async form=>{
     const content=form.get("content").trim();
     if (!content) { toast("总结内容不能为空",true); return; }
     await withLoading(()=>api.post("summaries/save",{date:summaryDate,content}));
@@ -417,6 +507,32 @@ function attendanceModal(memberId="",dateValue=iso(today),status="加班") {
 }
 
 document.addEventListener("click", async event => {
+  const tab=event.target.closest("[data-detail-tab]"); if(tab){state.detailTab=tab.dataset.detailTab;renderDetailTab();return;}
+  if(event.target.closest("[data-add-task]")){taskModal();return;}
+  const taskControl=event.target.closest("[data-edit-task],[data-toggle-task],[data-delete-task],[data-add-task-log]");
+  if(taskControl){
+    const id=Number(taskControl.dataset.editTask||taskControl.dataset.toggleTask||taskControl.dataset.deleteTask||taskControl.dataset.addTaskLog), task=state.selectedProject.tasks.find(t=>t.id===id);
+    if(taskControl.hasAttribute("data-edit-task")){taskModal(task);return;}
+    if(taskControl.hasAttribute("data-add-task-log")){await workLogModal(state.selectedProject.id,iso(today),{task_id:id});return;}
+    try {
+      if(taskControl.hasAttribute("data-delete-task")){
+        if(!await confirmAction("删除任务后将不计入进度，任务历史与关联记录仍会保留。确认删除？"))return;
+        await withLoading(()=>api.post("tasks/delete",{id,project_id:state.selectedProject.id}));
+      } else {
+        await withLoading(()=>api.post("tasks/save",{id,project_id:state.selectedProject.id,status:task.status==="完成"?"未完成":"完成",completed_date:task.status==="完成"?null:iso(new Date())}));
+      }
+      await loadProjects(); await openProject(state.selectedProject.id); toast("任务已更新");
+    }catch(_){} return;
+  }
+  const addLog=event.target.closest("[data-add-log-for-project]");if(addLog){await workLogModal(Number(addLog.dataset.addLogForProject));return;}
+  if(event.target.closest("[data-all-project-logs]")){state.projectLogRange={start:"",end:""};renderDetailTab();return;}
+
+  if (event.target.closest("[data-recent-project-logs]")) {
+    state.projectLogRange = recentProjectLogRange();
+    $("#project-log-start").value = state.projectLogRange.start;
+    $("#project-log-end").value = state.projectLogRange.end;
+    renderProjectLogs(); return;
+  }
   const editTodo = event.target.closest("[data-edit-todo]");
   const deleteTodo = event.target.closest("[data-delete-todo]");
   if (editTodo || deleteTodo) {
@@ -424,17 +540,25 @@ document.addEventListener("click", async event => {
       if (editTodo) await todoModal(state.todos.find(todo=>todo.id===Number(editTodo.dataset.editTodo)));
       else if (await confirmAction("确认删除这条待办？未发送的提醒将停止。")) {
         await withLoading(()=>api.post("todos/delete",{id:Number(deleteTodo.dataset.deleteTodo)}));
-        toast("待办已删除"); await withLoading(loadTodos);
+        toast("待办已删除"); await withLoading(loadTodos); if(state.view==="project-detail")await openProject(state.selectedProject.id);
       }
     } catch (_) { /* withLoading already displays the error. */ }
     return;
   }
-  const lifecycle=event.target.closest("[data-project-summary]"); if(lifecycle){projectSummaryModal(Number(lifecycle.dataset.projectSummary));return;}
-  const nav=event.target.closest("[data-view]"); if(nav){await switchView(nav.dataset.view);return;}
+  if(event.target.closest("[data-add-project-todo]")){await todoModal({project_id:state.selectedProject.id});return;}
+  if(event.target.closest("[data-add-project-log]")){workLogModal(state.selectedProject.id);return;}
+  const editLog=event.target.closest("[data-edit-project-log]");
+  if(editLog){const log=state.selectedProject.work_logs.find(item=>item.id==editLog.dataset.editProjectLog);workLogModal(state.selectedProject.id,log.work_date,log);return;}
+  const deleteLog=event.target.closest("[data-delete-project-log]");
+  if(deleteLog){if(await confirmAction("确认删除这条工作记录？")){await withLoading(()=>api.post("worklogs/delete",{id:Number(deleteLog.dataset.deleteProjectLog)}));await openProject(state.selectedProject.id);await loadProjects();toast("工作记录已删除");}return;}
+  const nav=event.target.closest("[data-view]"); if(nav){
+    if(nav.dataset.view==="project-detail"){setProjectMenuExpanded(nav.getAttribute("aria-expanded")!=="true");return;}
+    await switchView(nav.dataset.view);return;
+  }
   const go=event.target.closest("[data-go]"); if(go){await switchView(go.dataset.go);return;}
   if(event.target.closest("[data-close-modal]")){closeModal();return;}
   if(event.target.closest("[data-close-drawer]")||event.target===$("#drawer-backdrop")){closeDrawer();return;}
-  const deleteSummary=event.target.closest("[data-delete-summary]"); if(deleteSummary){if(await confirmAction(`确认删除 ${deleteSummary.dataset.deleteSummary} 的项目总结？`)){await withLoading(()=>api.post("summaries/delete",{date:deleteSummary.dataset.deleteSummary}));await loadSummaries();closeModal();toast("项目总结已删除");}return;}
+  const deleteSummary=event.target.closest("[data-delete-summary]"); if(deleteSummary){if(await confirmAction(`确认删除 ${deleteSummary.dataset.deleteSummary} 的每日总结？`)){await withLoading(()=>api.post("summaries/delete",{date:deleteSummary.dataset.deleteSummary}));await loadSummaries();closeModal();toast("每日总结已删除");}return;}
   const regenerateSummary=event.target.closest("[data-regenerate-summary]"); if(regenerateSummary){await generateSummaryModal(regenerateSummary.dataset.regenerateSummary);return;}
   if(event.target.closest("[data-save-summary-preview]")){
     if (!state.summaryPreview) return;
@@ -462,12 +586,27 @@ document.addEventListener("click", async event => {
   const att=event.target.closest("[data-att-date]"); if(att){attendanceModal(att.dataset.memberId,att.dataset.attDate,att.dataset.status||"加班");return;}
 });
 
-$("#nav").addEventListener("keydown",e=>{if(e.key==="Enter")e.target.click()});
+
+document.addEventListener("toggle",event=>{const id=event.target.dataset?.taskDetail;if(id){if(event.target.open)state.expandedTasks.add(Number(id));else state.expandedTasks.delete(Number(id));}},true);
+document.addEventListener("change",event=>{if(event.target.id==="task-filter"){state.taskFilter=event.target.value;renderDetailTab();}if(event.target.id==="project-log-task")renderProjectLogs();});
+function filterTaskSearch(event) {
+  if(event.target.id!=="task-search" || event.isComposing)return;
+  state.taskKeyword=event.target.value;
+  const pos=event.target.selectionStart;
+  renderDetailTab();
+  $("#task-search").focus({preventScroll:true});
+  $("#task-search").setSelectionRange(pos,pos);
+}
+document.addEventListener("input",filterTaskSearch);
+document.addEventListener("compositionend",filterTaskSearch);
+
 $("#member-search").addEventListener("input",renderMembers);
 $("#todo-search").addEventListener("input",renderTodos);
 $("#todo-project-filter").addEventListener("change",renderTodos);
 $("#project-search").addEventListener("input",renderProjects);
-$("#project-status-filter").addEventListener("change",()=>{renderProjects();renderTimeline();});
+$("#project-status-filter").addEventListener("change",renderProjects);
+$("#record-status-filter").addEventListener("change",renderTimeline);
+$("#record-search").addEventListener("input",renderTimeline);
 $("#attendance-month").addEventListener("change",()=>withLoading(loadAttendance));
 $("#summary-period").addEventListener("change",()=>withLoading(loadAttendance));
 $("#timeline-start").addEventListener("change",()=>withLoading(()=>Promise.all([loadTimeline(),loadSummaries()])));
@@ -476,15 +615,27 @@ $("#refresh").addEventListener("click",()=>loadView(state.view));
 $("#month-prev").addEventListener("click",()=>moveMonth(-1));
 $("#month-next").addEventListener("click",()=>moveMonth(1));
 function moveMonth(delta){const [y,m]=$("#attendance-month").value.split("-").map(Number),d=new Date(y,m-1+delta,1);$("#attendance-month").value=monthIso(d);withLoading(loadAttendance)}
-$("#primary-action").addEventListener("click",async()=>{if(state.view==="todos"){try {await todoModal();}catch(_){} return;}if(state.view==="members")memberModal();else if(state.view==="attendance")attendanceModal();else{if(!state.members.length)state.members=await api.get("members");await projectModal();}});
+$("#primary-action").addEventListener("click",async()=>{if(state.view==="project-records"){await generateSummaryModal($("#timeline-end").value);return;}if(state.view==="project-detail"){if(state.selectedProject)workLogModal(state.selectedProject.id);return;}if(state.view==="todos"){try {await todoModal();}catch(_){} return;}if(state.view==="members")memberModal();else if(state.view==="attendance")attendanceModal();else{if(!state.members.length)state.members=await api.get("members");await projectModal();}});
 $("#modal-backdrop").addEventListener("click",closeModal);
 $("#confirm-cancel").addEventListener("click",()=>resolveConfirmation(false));
 $("#confirm-submit").addEventListener("click",()=>resolveConfirmation(true));
 $("#confirm-backdrop").addEventListener("click",()=>resolveConfirmation(false));
-document.addEventListener("keydown",event=>{if(event.key==="Escape"&&confirmResolver)resolveConfirmation(false);});
+document.addEventListener("keydown",event=>{
+  const modal=confirmResolver?$("#confirm-modal"):!$("#modal").classList.contains("hidden")?$("#modal"):null;
+  if(event.key==="Escape"){if(confirmResolver)resolveConfirmation(false);else if(modal)closeModal();else closeDrawer();}
+  if(event.key==="Tab"&&modal){
+    const controls=$$('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]',modal).filter(el=>el.getClientRects().length);
+    const first=controls[0],last=controls.at(-1);
+    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last?.focus();}
+    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}
+  }
+});
 
 const initialView = new URLSearchParams(location.search).get("view");
-await switchView(viewMeta[initialView] ? initialView : "dashboard");
+await withLoading(loadProjects);
+const initialProject = Number(new URLSearchParams(location.search).get("project"));
+if (initialView === "project-detail" && state.projects.some(p => p.id === initialProject)) await openProject(initialProject);
+else await switchView(viewMeta[initialView] ? initialView : "projects");
 setInterval(() => {
   if (state.view === "todos" && !document.hidden && $("#modal").classList.contains("hidden") && !confirmResolver && !loadingCount) {
     loadTodos().catch(() => { $("#todo-push-notice").textContent = "待办状态刷新失败，请点击右上角刷新重试。"; });
@@ -498,29 +649,46 @@ function createDemoApi(){
   store.projects.push({id:5,name:"内部工具升级",description:"等待资源后继续推进",status:"暂停",start_date:dates[0],end_date:null,created_at:now,updated_at:now,latest_record_date:null,members:[store.members[0]]});
   store.logs=[{id:1,project_id:1,work_date:dates[4],content:"完成需求评审，开始数据库设计"},{id:2,project_id:1,work_date:dates[4],content:"整理客户字段与权限矩阵"},{id:3,project_id:2,work_date:dates[4],content:"修复登录模块问题"},{id:4,project_id:3,work_date:dates[4],content:"完成上线验收"}];
   store.members.forEach(member => { member.projects = store.projects.filter(project => project.members.some(item => item.id === member.id)).map(project=>({...project,joined_at:dates[0],left_at:null})); });
+  store.tasks = store.projects.slice(0,3).flatMap((p,i)=>[0,1,2].map((n)=>({id:i*3+n+1,project_id:p.id,name:["需求梳理","核心功能开发","联调与验收"][n],description:["确认范围与验收标准","交付核心流程","验证端到端工作流"][n],status:n<2?"完成":"未完成",start_date:dates[Math.min(n,2)],completed_date:n<2?dates[n+1]:null,created_at:now,updated_at:now,deleted_at:null,history:[]})));
+  store.logs.forEach((log,i)=>{log.task_id=log.project_id===1?3:log.project_id===2?6:9;});
+  const taskData=projectId=>store.tasks.filter(t=>t.project_id==projectId).map(t=>({...t,duration_days:Math.max(0,Math.round((Date.parse(t.completed_date||t.deleted_at?.slice(0,10)||iso(new Date()))-Date.parse(t.start_date))/86400000)+1)}));
+  const progressData=p=>{const ts=taskData(p.id).filter(t=>!t.deleted_at),done=ts.filter(t=>t.status==="完成").length;return {...p,task_count:ts.length,completed_task_count:done,progress:ts.length?Math.round(done/ts.length*100):0};};
+  const decoratedLog=log=>{const t=store.tasks.find(t=>t.id===log.task_id);return {...log,task_name:t?.name,task_deleted_at:t?.deleted_at};};
+  const auditTask=(task,event)=>task.history.push({id:Date.now(),event,changed_at:new Date().toISOString(),snapshot:{name:task.name,status:task.status,start_date:task.start_date,completed_date:task.completed_date}});
+  store.tasks.forEach(t=>auditTask(t,"创建"));
   const calendar=month=>{const end=Number(lastDay(month).slice(-2));return {month,workdays:0,days:Array.from({length:end},(_,i)=>{const date=`${month}-${String(i+1).padStart(2,"0")}`,weekday=new Date(date+"T00:00:00").getDay();const is_workday=weekday!==0&&weekday!==6;return {date,weekday:(weekday+6)%7,is_workday,source:"法定日历"}})}};
   const rangeDates=(start,end)=>{const result=[];for(let day=new Date(start+"T00:00:00");day<=new Date(end+"T00:00:00");day.setDate(day.getDate()+1))result.push(iso(day));return result};
   const todayValue=iso(today);
   const refreshLatestRecord=projectId=>{const project=store.projects.find(item=>item.id==projectId);if(project)project.latest_record_date=store.logs.filter(log=>log.project_id==projectId).reduce((latest,log)=>!latest||log.work_date>latest?log.work_date:latest,null)};
   const attendanceSummary=(start,end)=>{const boundedEnd=end>todayValue?todayValue:end,workdays=rangeDates(start,boundedEnd).filter(day=>{const weekday=new Date(day+"T00:00:00").getDay();return weekday!==0&&weekday!==6});return store.members.map(member=>({id:member.id,name:member.name,normal_days:workdays.length,overtime_days:0,time_off_days:0}))};
   store.todos = [{id:1,project_id:1,project_name:store.projects[0].name,content:"整理客户字段与权限清单，安排接口联调",push_mode:"once",push_enabled:0,push_at:null,created_at:now,updated_at:now,sent_at:null,push_error:""}];
-  const attendanceTotals=rows=>rows.reduce((totals,row)=>({normal:totals.normal+row.normal_days,overtime:totals.overtime+row.overtime_days,time_off:totals.time_off+row.time_off_days}),{normal:0,overtime:0,time_off:0});
   return {
     async get(endpoint,params={}){
       await new Promise(resolve=>setTimeout(resolve,80));
-      if(endpoint==="dashboard"){const rows=attendanceSummary(`${monthIso(today)}-01`,todayValue);return {metrics:{total:5,active:1,finished:1,paused:1},recent_projects:store.projects,attendance:attendanceTotals(rows)}};
+      if(endpoint==="tasks")return taskData(params.project_id);
       if(endpoint==="todos")return {todos:store.todos,push_configured:false};
       if(endpoint==="members")return store.members;
-      if(endpoint==="projects")return params.summary_date?store.projects.map(project=>({...project,has_records:store.logs.some(log=>log.project_id===project.id&&log.work_date===params.summary_date)})):store.projects;
+      if(endpoint==="projects")return params.summary_date?store.projects.map(project=>({...project,has_records:store.logs.some(log=>log.project_id===project.id&&log.work_date===params.summary_date),has_task_changes:store.tasks.some(task=>task.project_id===project.id&&task.history.some(h=>h.changed_at.slice(0,10)===params.summary_date))})):store.projects.map(progressData);
       if(endpoint==="summaries"){const range=rangeDates(params.start,params.end);return {dates:range,summaries:Object.values(store.summaries).filter(item=>range.includes(item.summary_date))}}
       if(endpoint==="timeline"){const range=rangeDates(params.start,params.end),logs={};store.logs.filter(log=>range.includes(log.work_date)).forEach(log=>(logs[`${log.project_id}:${log.work_date}`]??=[]).push(log));return {dates:range,projects:store.projects,logs}}
-      if(endpoint==="worklogs"){const project=store.projects.find(item=>item.id==params.project_id);return {project,date:params.date,logs:store.logs.filter(log=>log.project_id==params.project_id&&log.work_date===params.date)}}
-      if(endpoint==="projects/detail"){const project=store.projects.find(item=>item.id==params.id);return {...project,status_history:[{id:1,from_status:"准备",to_status:project.status,changed_at:now,note:"进入当前阶段"},{id:2,from_status:null,to_status:"准备",changed_at:dates[0],note:"项目创建"}],membership_history:project.members.map((member,index)=>({id:index+1,name:member.name,joined_at:dates[0],left_at:null,join_reason:"项目创建",leave_reason:""}))}}
+      if(endpoint==="worklogs"){const project=store.projects.find(item=>item.id==params.project_id);return {project,date:params.date,logs:store.logs.filter(log=>log.project_id==params.project_id&&log.work_date===params.date).map(decoratedLog)}}
+      if(endpoint==="projects/detail"){const project=store.projects.find(item=>item.id==params.id);return {...progressData(project),tasks:taskData(project.id),work_logs:store.logs.filter(log=>log.project_id==params.id).map(decoratedLog).sort((a,b)=>b.work_date.localeCompare(a.work_date)||b.id-a.id),status_history:[{id:1,from_status:"准备",to_status:project.status,changed_at:now,note:"进入当前阶段"},{id:2,from_status:null,to_status:"准备",changed_at:dates[0],note:"项目创建"}],membership_history:project.members.map((member,index)=>({id:index+1,name:member.name,joined_at:dates[0],left_at:null,join_reason:"项目创建",leave_reason:""}))}}
       if(endpoint==="attendance"){const result=calendar(params.month);result.workdays=result.days.filter(day=>day.is_workday).length;const assignments={};result.days.filter(day=>day.date<=todayValue).forEach(day=>store.projects.filter(project=>(project.status==="进行"||(project.status==="维护"&&store.logs.some(log=>log.project_id===project.id&&log.work_date===day.date)))).forEach(project=>project.members.forEach(member=>(assignments[`${member.id}:${day.date}`]??=[]).push(project.name))));return {calendar:result,members:store.members,records:{},assignments,today:todayValue}}
       if(endpoint==="attendance/summary"){const start=params.start||`${monthIso(today)}-01`,requestedEnd=params.end||todayValue,end=requestedEnd>todayValue?todayValue:requestedEnd,summary=attendanceSummary(start,end);return {start,end,summary,details:[]}};
       return {};
     },
     async post(endpoint,body){
+      if(endpoint==="tasks/save"){
+        let task=store.tasks.find(t=>t.id===body.id), before=task?.status;
+        const values={name:"",description:"",status:"未完成",start_date:iso(new Date()),completed_date:null,...task,...body};
+        if(!values.name.trim())throw new Error("任务名称不能为空");
+        if(values.status==="完成"&&(values.completed_date<values.start_date||values.completed_date>iso(new Date())))throw new Error("完成日期不能早于开始日期或晚于今天");
+        if(!task){task={id:Date.now(),created_at:new Date().toISOString(),history:[]};store.tasks.push(task);}
+        Object.assign(task,values,{id:task.id,updated_at:new Date().toISOString()});
+        if(task.status==="未完成")task.completed_date=null;
+        auditTask(task,!before?"创建":before!==task.status?(task.status==="完成"?"完成":"重新打开"):"修改");return task;
+      }
+      if(endpoint==="tasks/delete"){const task=store.tasks.find(t=>t.id===body.id);task.deleted_at=new Date().toISOString();auditTask(task,"删除");return {deleted:true};}
       if(endpoint==="todos/save"){
         const project=store.projects.find(item=>item.id===body.project_id);
         if(!project)throw new Error("请选择项目");
@@ -534,12 +702,20 @@ function createDemoApi(){
         return saved;
       }
       if(endpoint==="todos/delete"){store.todos=store.todos.filter(item=>item.id!==body.id);return {deleted:true};}
-      if(endpoint==="ai/project-summary"){const project=store.projects.find(item=>item.id===body.project_id);if(!project)throw new Error("项目不存在");return {content:`演示总结：${project.name}\n当前状态：${project.status}\n正式环境将依据全部状态历史与工作记录生成各阶段总结。`}}
       await new Promise(resolve=>setTimeout(resolve,endpoint==="ai/summary"?450:120));
-      if(endpoint==="ai/summary"){const content="今日完成：所选项目均按计划推进。\n风险与阻塞：暂无明确阻塞。\n明日建议：继续推进接口联调与验收。",persisted=!store.summaries[body.date]||body.overwrite;if(persisted)store.summaries[body.date]={id:Date.now(),summary_date:body.date,project_ids:body.project_ids,project_names:store.projects.filter(project=>body.project_ids.includes(project.id)).map(project=>project.name),provider_id:"demo",content,created_at:new Date().toISOString()};return {content,date:body.date,project_ids:body.project_ids,persisted}}
+      if(endpoint==="ai/summary"){const content=store.projects.filter(p=>body.project_ids.includes(p.id)).map(p=>{const logs=store.logs.filter(l=>l.project_id===p.id&&l.work_date===body.date);return `${p.name}：${logs.length?logs.map(l=>`${store.tasks.find(t=>t.id===l.task_id)?.name||"项目级记录"}：${l.content}`).join("；"):"当天无工作记录"}。`}).join("\n"),persisted=!store.summaries[body.date]||body.overwrite;if(persisted)store.summaries[body.date]={id:Date.now(),summary_date:body.date,project_ids:body.project_ids,project_names:store.projects.filter(project=>body.project_ids.includes(project.id)).map(project=>project.name),provider_id:"demo",content,created_at:new Date().toISOString()};return {content,date:body.date,project_ids:body.project_ids,persisted}}
       if(endpoint==="summaries/save"){const saved=store.summaries[body.date];store.summaries[body.date]={...saved,content:body.content,project_ids:body.project_ids||saved.project_ids,created_at:new Date().toISOString()};store.summaries[body.date].project_names=store.projects.filter(project=>store.summaries[body.date].project_ids.includes(project.id)).map(project=>project.name);return store.summaries[body.date]}
       if(endpoint==="summaries/delete"){delete store.summaries[body.date];return {deleted:true}}
-      if(endpoint==="worklogs/save"){if(body.id){const log=store.logs.find(item=>item.id==body.id);Object.assign(log,body);refreshLatestRecord(log.project_id)}else{store.logs.push({...body,id:Date.now()});refreshLatestRecord(body.project_id)}return body}
+      if(endpoint==="worklogs/save"){
+        if(!body.content?.trim())throw new Error("工作内容不能为空");
+        const task=store.tasks.find(t=>t.id===body.task_id);
+        if(task&&body.task_action&&body.task_action!=="keep"){
+          if(body.task_action==="complete"&&(body.work_date<task.start_date||body.work_date>iso(new Date())))throw new Error("完成日期不能早于开始日期或晚于今天");
+          const status=body.task_action==="complete"?"完成":"未完成";
+          if(status!==task.status){task.status=status;task.completed_date=status==="完成"?body.work_date:null;auditTask(task,status==="完成"?"完成":"重新打开");}
+        }
+        if(body.id)Object.assign(store.logs.find(l=>l.id===body.id),body,{updated_at:new Date().toISOString()});else store.logs.push({...body,id:Date.now(),created_at:new Date().toISOString()});refreshLatestRecord(body.project_id);return body;
+      }
       if(endpoint==="worklogs/delete"){const log=store.logs.find(item=>item.id==body.id);store.logs=store.logs.filter(item=>item.id!=body.id);if(log)refreshLatestRecord(log.project_id);return {deleted:true}}
       if(endpoint==="members/save"){if(body.id)Object.assign(store.members.find(member=>member.id===body.id),body);else store.members.push({...body,id:Date.now(),ready_projects:0,active_projects:0,maintenance_projects:0,paused_projects:0,completed_projects:0});return body}
       if(endpoint==="projects/save"){const members=store.members.filter(member=>body.member_ids.includes(member.id));if(body.id)Object.assign(store.projects.find(project=>project.id===body.id),body,{members,updated_at:now});else store.projects.unshift({...body,id:Date.now(),members,created_at:now,updated_at:now,latest_record_date:null});return body}

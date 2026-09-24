@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -16,6 +15,18 @@ class DatabaseTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_project_detail_includes_all_work_logs_in_date_order(self):
+        project = self.db.save_project({"name": "完整工作记录"})
+        for index in range(65):
+            self.db.save_work_log({"project_id": project["id"],
+                                   "work_date": "2026-09-20" if index % 2 else "2026-09-21",
+                                   "content": f"记录{index}"})
+        logs = self.db.project_detail(project["id"])["work_logs"]
+        self.assertEqual(len(logs), 65)
+        self.assertEqual(logs[0]["content"], "记录64")
+        self.assertEqual([log["work_date"] for log in logs],
+                         sorted([log["work_date"] for log in logs], reverse=True))
 
     def test_invalid_input_does_not_create_entities(self):
         for value in (None, [], {}, True, 123):
@@ -147,23 +158,6 @@ class DatabaseTests(unittest.TestCase):
                          ids(before["status_history"]))
         self.assertEqual(self.db.project_detail(first["id"])["status"], "维护")
 
-    def test_lifecycle_material_contains_all_logs_and_chronological_stages(self):
-        project = self.db.save_project({"name": "全周期项目", "status": "维护"})
-        other = self.db.save_project({"name": "其他项目"})
-        self.db.insert_status_history({"project_id": project["id"], "to_status": "进行",
-                                       "changed_at": "2020-01-01T00:00:00"})
-        for index in range(65):
-            self.db.save_work_log({"project_id": project["id"], "work_date": "2020-01-02",
-                                   "content": f"工作记录{index}"})
-        self.db.save_work_log({"project_id": other["id"], "work_date": "2020-01-02", "content": "不应混入"})
-        material = json.loads(self.db.project_lifecycle_material(project["id"]))
-        self.assertEqual(len(material["work_logs"]), 65)
-        self.assertEqual(material["work_logs"][0]["content"], "工作记录0")
-        self.assertEqual(material["work_logs"][-1]["content"], "工作记录64")
-        self.assertEqual(material["work_logs"][0]["status_on_date"], "进行")
-        self.assertEqual(material["status_history"][0]["to_status"], "进行")
-        self.assertEqual(material["project"]["id"], project["id"])
-
     def test_project_id_is_numeric_and_immutable(self):
         project = self.db.save_project({"name": "编号项目"})
         self.assertIsInstance(project["id"], int)
@@ -209,33 +203,6 @@ class DatabaseTests(unittest.TestCase):
         self.assertNotIn("latest_log", listed)
         self.assertEqual(dashboard["latest_record_date"], "2026-01-05")
         self.assertNotIn("latest", dashboard)
-
-    def test_project_overview_defaults_to_non_finished_and_filters_statuses(self):
-        ready = self.db.save_project({"name": "准备项目", "status": "准备"})
-        active = self.db.save_project({"name": "进行项目", "status": "进行"})
-        maintenance = self.db.save_project({"name": "维护项目", "status": "维护"})
-        paused = self.db.save_project({"name": "暂停项目", "status": "暂停"})
-        finished = self.db.save_project({"name": "结束项目", "status": "结束"})
-
-        default_projects = self.db.list_project_overview()
-        selected_projects = self.db.list_project_overview(["准备", "暂停"])
-
-        self.assertEqual(
-            [item["id"] for item in default_projects],
-            [ready["id"], active["id"], maintenance["id"], paused["id"]],
-        )
-        self.assertEqual(
-            [item["id"] for item in selected_projects], [ready["id"], paused["id"]]
-        )
-        self.assertEqual(
-            [item["id"] for item in self.db.list_project_overview(["结束"])],
-            [finished["id"]],
-        )
-        self.assertEqual(
-            set(selected_projects[0]), {"id", "name", "status"}
-        )
-        with self.assertRaisesRegex(ValidationError, "正确写法：/项目总览"):
-            self.db.list_project_overview(["执行中"])
 
     def test_default_summary_projects_require_records_regardless_of_status(self):
         day = datetime.now().astimezone().date().isoformat()
