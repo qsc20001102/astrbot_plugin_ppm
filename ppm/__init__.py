@@ -1,4 +1,4 @@
-"""PPM plugin domain package."""
+"""Standalone PPM domain package."""
 
 from .database import Database
 

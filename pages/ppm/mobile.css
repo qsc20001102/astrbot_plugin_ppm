@@ -1,43 +1,158 @@
+/* Shared identity; loaded last so mobile rules have one authoritative layer. */
+.brand { gap: 10px; padding: 0 8px 28px; align-items: center; }
+.brand img { flex-shrink: 0; }
+.brand strong { color: #fff; font-size: 17px; letter-spacing: 0; line-height: 1.5; }
+.mobile-only, .navigation-backdrop { display: none; }
+@media (min-width: 641px) and (max-width: 1200px) {
+  .brand { gap: 8px; padding-left: 0; padding-right: 0; }
+  .brand img { width: 32px; height: 32px; }
+  .brand strong { font-size: 14px; }
+}
 @media (max-width: 640px) {
-  #view-members .table-surface table,
-  #view-projects .table-surface table { min-width: 720px; }
-  .member-cell { min-width: 150px; }
-  body { padding-bottom: 66px; }
-  .app-shell { display: block; }
-  .sidebar {
-    position: fixed;
-    z-index: 10;
-    inset: auto 0 0;
-    width: 100%;
-    height: 64px;
-    border: 0;
-    border-top: 1px solid var(--border);
-    padding: 6px 8px;
-  }
-  .brand, .sidebar-footer { display: none; }
-  .sidebar nav { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
-  .sidebar nav button, .sidebar nav button:not(.active) {
-    height: 50px;
-    padding: 4px;
-    justify-content: center;
-    flex-direction: column;
-    gap: 2px;
-    font-size: 10px;
-    text-align: center;
-  }
-  .sidebar nav button span { width: auto; font-size: 16px; }
-  main { padding: 0 12px 24px; }
-  .topbar { height: 76px; gap: 8px; }
-  .topbar h1 { font-size: 20px; }
-  .topbar p { max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .topbar > div:first-child { min-width: 0; }
-  .top-actions { margin-left: auto; }
-  .top-actions .icon-button { display: none; }
-  .top-actions .primary { padding: 8px 10px; white-space: nowrap; }
-  .metric { padding: 15px; }
-  .metric strong { font-size: 22px; }
-  .modal { max-height: 82vh; }
-  #recent-projects .list-row { grid-template-columns: minmax(0, 1fr) auto; }
-  #recent-projects .list-row small { display: none; }
-  #recent-projects .list-row .latest-record-date { display: block; }
+  /* Let the document scroll; only date matrices retain their own scroll area. */
+  body { padding: 0; }
+  .app-shell { display: block; min-height: 100dvh; }
+  main { display: block; height: auto; min-height: 100dvh; padding: 0 14px calc(24px + env(safe-area-inset-bottom)); }
+  .view { display: block; overflow: visible; min-width: 0; }
+  .view > .surface { height: auto; min-height: 0; }
+  .surface { flex-shrink: 0; }
+  .mobile-only { display: inline-grid; }
+  button, .icon-button, .primary, .secondary, .text-action { min-height: 44px; }
+  .icon-button { width: 44px; flex-shrink: 0; }
+  input, select, textarea { font-size: 16px; min-height: 44px; max-width: 100%; min-width: 0; }
+  input[type=checkbox] { min-height: 20px; width: 20px; height: 20px; flex-shrink: 0; }
+  .text-action { padding: 8px 10px; }
+  .topbar { height: auto; min-height: 130px; padding: calc(16px + env(safe-area-inset-top)) 0 16px; display: grid; grid-template-columns: 44px minmax(0,1fr); gap: 8px 12px; }
+  .topbar > div:first-of-type { min-width: 0; }
+  .topbar h1, #page-title { font-size: 22px; max-width: none; margin: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.4; }
+  .topbar p { font-size: 12px; max-width: none; margin-top: 4px; white-space: normal; line-height: 1.5; }
+  .top-actions { grid-column: 1/-1; margin-left: 0; justify-content: flex-end; gap: 8px; }
+  .top-actions .icon-button { display: inline-grid; }
+  .top-actions .primary { font-size: 14px; padding: 10px 16px; }
+  .top-actions > span { display: none; }
+  /* An off-canvas menu keeps all eight sections reachable without a two-row dock. */
+  .sidebar { position: fixed; z-index: 19; inset: 0 auto 0 0; width: min(310px,88vw); height: 100dvh; padding: calc(20px + env(safe-area-inset-top)) 14px calc(16px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; visibility: hidden; transform: translateX(-100%); }
+  .navigation-open { overflow: hidden; }
+  .navigation-open .sidebar { visibility: visible; transform: none; }
+  .navigation-backdrop:not([hidden]) { display: block; position: fixed; inset: 0; z-index: 18; border: 0; border-radius: 0; background: #14221f66; width: 100%; height: 100%; }
+  .sidebar .brand { display: flex; padding: 0 0 20px; gap: 10px; }
+  .sidebar .brand strong { font-size: 17px; }
+  .sidebar .brand img { width: 36px; height: 36px; }
+  #close-navigation { margin-left: auto; background: transparent; color: #fff; border-color: var(--nav-border); font-size: 24px; }
+  .sidebar nav { display: flex; flex-direction: column; overflow-y: auto; gap: 5px; }
+  .sidebar nav > button, .sidebar nav > button:not(.active) { flex-direction: row; justify-content: flex-start; height: 48px; padding: 0 16px; font-size: 14px; gap: 16px; text-align: left; }
+  .sidebar nav svg { width: 21px; height: 21px; }
+  .sidebar .project-submenu { position: static; width: auto; height: auto; max-height: none; min-height: 0; margin: 0 0 8px 26px; padding: 0 0 0 8px; border: 0; border-left: 1px solid var(--nav-border); border-radius: 0; box-shadow: none; flex-shrink: 0; }
+  .sidebar .project-submenu button { min-height: 44px; height: auto; flex-direction: row; }
+  .sidebar-caption { display: none; }
+  /* Search and filters wrap by purpose, without shrinking the touch targets. */
+  .toolbar { gap: 10px; }
+  .toolbar-group { min-width: 0; width: 100%; flex-wrap: wrap; }
+  .status-checkboxes { gap: 4px 12px; }
+  .status-checkboxes label { min-height: 40px; gap: 6px; }
+  .status-checkboxes > span { width: 100%; }
+  #project-search, #record-search, #member-search { width: 100%; margin: 0; }
+  .search-wrap { width: 100%; }
+  #view-project-records > .toolbar:first-child .toolbar-group { display: grid; grid-template-columns: minmax(0,1fr) 18px minmax(0,1fr); gap: 6px; }
+  #view-project-records > .toolbar:first-child label { grid-column: 1/-1; }
+  #view-project-records > .toolbar:first-child input { width: 100%; font-size: 14px; padding: 9px 5px; }
+  .metric-band.compact .metric { padding: 15px; }
+  .metric strong { font-size: 28px; }
+  /* Projects, members and task lists become labelled cards, using the same data. */
+  #view-projects .table-surface, #view-members .table-surface { background: transparent; border: 0; overflow: visible; }
+  #view-projects table, #view-members table, .task-table-panel table { display: block; min-width: 0; width: 100%; }
+  #view-projects thead, #view-members thead, .task-table-panel thead { display: none; }
+  #projects-body, #members-body, .task-table-panel tbody { display: grid; gap: 12px; }
+  #projects-body tr, #members-body tr, .task-table-panel tbody tr { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  #projects-body td, #members-body td, .task-table-panel td { display: block; height: auto; min-width: 0; max-width: none; padding: 0; border: 0; font-size: 13px; overflow-wrap: anywhere; }
+  #projects-body td::before, #members-body td::before, .task-table-panel td::before { content: attr(data-label); display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+  #projects-body td:first-child { grid-column: 1/-1; }
+  #projects-body td:first-child::before, #projects-body td:last-child::before, #members-body td:first-child::before, #members-body td:last-child::before, .task-table-panel td:first-child::before, .task-table-panel td:last-child::before { display: none; }
+  #projects-body td:nth-child(3) { grid-column: 1/-1; grid-row: 2; }
+  #projects-body td:last-child, #members-body td:last-child, .task-table-panel td:last-child { grid-column: 1/-1; border-top: 1px solid var(--border); padding-top: 8px; }
+  #projects-body .actions, #members-body .actions, .task-table-panel .actions { justify-content: flex-end; gap: 8px; }
+  .project-cell strong { font-size: 16px; line-height: 1.6; }
+  .project-progress { min-width: 0; max-width: 100%; }
+  .member-stack { padding-left: 5px; }
+  #members-body tr { grid-template-columns: repeat(5,minmax(0,1fr)); gap: 12px 6px; }
+  #members-body td:first-child { grid-column: 1/-1; }
+  #members-body td:not(:first-child):not(:last-child) { text-align: center; background: var(--theme-panel); border-radius: 6px; padding: 8px 0; }
+  .member-cell { min-width: 0; }
+  .member-cell > div { min-width: 0; }
+  .member-cell strong, .member-cell small { overflow-wrap: anywhere; }
+  .task-table-scroll { overflow: visible; padding: 12px; }
+  .task-table-panel td:first-child, .task-table-panel td:nth-child(2) { grid-column: 1/-1; }
+  .task-description { white-space: normal; max-width: none; }
+  /* Detail views retain all facts and let long records flow down the page. */
+  .summary-fact:last-child { display: block; grid-column: 1/-1; }
+  .project-summary-band { padding: 18px; }
+  .detail-tabs { gap: 0; justify-content: space-between; }
+  .detail-tabs button { flex: 1; padding: 14px 4px; }
+  .detail-command .secondary { font-size: 12px; }
+  .task-filter { flex-wrap: wrap; }
+  .task-filter input { flex: 1; width: 0; }
+  .task-filter select { width: 116px; font-size: 14px; }
+  .task-journal { max-height: none; overflow: visible; }
+  .task-records p { font-size: 14px; }
+  .project-info-grid dd { max-height: none; overflow: visible; }
+  .project-log-range { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .project-log-range > * { min-width: 0; max-width: 100%; }
+  .project-log-range input { font-size: 14px; padding: 8px; }
+  .project-log-range label { min-width: 0; }
+  .history-item .actions { gap: 4px; }
+  /* Date-based tables scroll locally with sticky row names. */
+  #view-project-records > .progress-panel { display: block; min-height: 0; }
+  #summary-timeline { height: auto; }
+  .timeline-wrap, #timeline { max-height: 65dvh; overflow: auto; }
+  .timeline-table { min-width: 720px; }
+  .timeline-table th:first-child, .timeline-table td:first-child { min-width: 110px; max-width: 130px; white-space: normal; overflow-wrap: anywhere; padding: 8px; }
+  .timeline-cell { min-height: 44px; }
+  #view-attendance .attendance-layout { display: grid; grid-template-columns: minmax(0,1fr); grid-template-rows: auto auto; min-height: 0; gap: 0; }
+  #view-attendance .calendar-grid { flex: none; overflow: visible; padding: 12px; }
+  .calendar-day { min-height: 46px; }
+  #view-attendance .scroll-table { flex: none; max-height: 60dvh; overflow: auto; }
+  .attendance-table th, .attendance-table td { padding: 3px; min-width: 44px; }
+  .attendance-cell { width: 38px; height: 44px; }
+  .attendance-table th:first-child, .attendance-table td:first-child { min-width: 88px; max-width: 100px; padding: 6px; white-space: normal; overflow-wrap: anywhere; }
+  #view-attendance > .surface { min-height: 0; display: block; }
+  #view-attendance .summary-split { display: grid; grid-template-columns: minmax(0,1fr); grid-template-rows: auto auto; gap: 24px; padding: 16px; }
+  #view-attendance .summary-split > div { height: auto; overflow: visible; }
+  .summary-row { grid-template-columns: minmax(0,1fr) repeat(3,48px); padding: 10px 4px; }
+  #attendance-summary > .header { position: static; }
+  #attendance-details > .detail-line { flex: none; }
+  #view-attendance .toolbar-group { justify-content: space-between; }
+  #attendance-month { flex: 1; width: 0; text-align: center; }
+  /* Settings, todos and dialogs share full-width, readable form controls. */
+  .settings-panel { padding: 18px; max-width: 100%; }
+  .settings-panel h2 { font-size: 18px; }
+  .settings-actions { gap: 8px; }
+  .settings-actions > * { flex: 1 1 130px; min-width: 0; }
+  .settings-actions select { width: 100%; }
+  .settings-panel .muted-note, .field small { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+  .model-discovery { gap: 8px; }
+  .model-discovery select { min-width: 0; }
+  .saved-model { min-width: 0; }
+  .saved-model button { min-width: 0; }
+  .todo-filters { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .todo-filters input { grid-column: 1/-1; width: 100%; min-width: 0; }
+  .todo-filters select { width: 100%; font-size: 14px; }
+  .todo-filters > button { grid-column: 1/-1; justify-self: end; }
+  .todo-check { width: 44px; height: 44px; }
+  .todo-meta { gap: 6px 10px; }
+  .todo-card .actions { padding-top: 8px; border-top: 1px solid var(--border); }
+  .modal, .drawer { inset: auto 0 0; transform: none; width: 100%; height: auto; max-height: calc(100dvh - env(safe-area-inset-top) - 12px); border-radius: 16px 16px 0 0; overflow-y: auto; padding-bottom: env(safe-area-inset-bottom); }
+  .modal-head, .drawer-head { padding: 18px; gap: 12px; }
+  .modal-head > div, .drawer-head > div { min-width: 0; }
+  .modal-head h2, .drawer-head h2 { font-size: 20px; overflow-wrap: anywhere; }
+  .form-grid { grid-template-columns: minmax(0,1fr); padding: 18px; }
+  .modal-actions { position: sticky; bottom: 0; padding: 12px 18px; gap: 10px; z-index: 2; }
+  .modal-actions > button { flex: 1; }
+  .checkbox-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .check-item { min-width: 0; overflow-wrap: anywhere; align-items: center; }
+  .drawer-body { padding: 18px; grid-template-columns: minmax(0,1fr); }
+  .drawer-body .list-row { grid-template-columns: minmax(0,1fr) auto !important; gap: 8px; }
+  .drawer-body .list-row small { grid-column: 1/-1; white-space: normal; }
+  .definition-list { grid-template-columns: 70px minmax(0,1fr); }
+  .confirm-modal { max-height: 90dvh; overflow: auto; }
+  .toast { width: max-content; max-width: calc(100vw - 28px); }
 }

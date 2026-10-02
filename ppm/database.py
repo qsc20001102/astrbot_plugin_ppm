@@ -4,17 +4,14 @@ import json
 import math
 import sqlite3
 import threading
-import time
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .calendar_service import date_range, default_is_workday, month_bounds
 from .errors import NotFoundError, ValidationError
-from .todo_schedule import next_weekly, weekly_values
 from .task_repository import TASK_SCHEMA, TaskRepository
 from .validation import (
     optional_text,
@@ -50,30 +47,25 @@ class Database(TaskRepository):
             if self._initialized:
                 return
             with self._connection() as conn:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version > 5:
+                    raise ValidationError("数据库版本高于当前程序版本")
                 conn.executescript(SCHEMA)
                 conn.execute("BEGIN IMMEDIATE")
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(todos)")}
-                if "push_mode" not in columns:
-                    conn.execute("ALTER TABLE todos ADD COLUMN push_mode TEXT NOT NULL DEFAULT 'once'")
-                    conn.execute("ALTER TABLE todos ADD COLUMN push_weekdays TEXT NOT NULL DEFAULT '[]'")
-                    conn.execute("ALTER TABLE todos ADD COLUMN push_time TEXT NOT NULL DEFAULT ''")
-                    conn.execute("ALTER TABLE todos ADD COLUMN push_utc_offset INTEGER NOT NULL DEFAULT 480")
-                if "status" in columns:
-                    # Keep previously stopped reminders stopped when removing task states.
-                    conn.execute("UPDATE todos SET push_enabled=0 WHERE status IN ('已完成','已取消')")
-                    conn.execute(TODO_SCHEMA.replace("todos (", "todos_rebuilt ("))
-                    names = [row["name"] for row in conn.execute("PRAGMA table_info(todos_rebuilt)")]
-                    fields = ",".join(names)
-                    conn.execute(f"INSERT INTO todos_rebuilt({fields}) SELECT {fields} FROM todos")
-                    conn.execute("DROP TABLE todos")
-                    conn.execute("ALTER TABLE todos_rebuilt RENAME TO todos")
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='todos'").fetchone():
+                    conn.execute("ALTER TABLE todos RENAME TO legacy_todos")
                 conn.execute("DROP INDEX IF EXISTS idx_todos_due")
-                conn.execute("CREATE INDEX idx_todos_due ON todos(push_due,retry_at) WHERE deleted_at IS NULL AND push_enabled=1")
+                if version < 5:
+                    columns = {r["name"] for r in conn.execute("PRAGMA table_info(legacy_todos)")}
+                    if {"id", "project_id", "content", "created_at", "updated_at", "deleted_at"} <= columns:
+                        status = "CASE WHEN status='已完成' THEN '已完成' ELSE '未完成' END" if "status" in columns else "'未完成'"
+                        conn.execute(f"""INSERT INTO project_todos(id,project_id,content,status,created_at,updated_at,deleted_at)
+                            SELECT id,project_id,content,{status},created_at,updated_at,deleted_at FROM legacy_todos""")
                 log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(work_logs)")}
                 if "task_id" not in log_columns:
                     conn.execute("ALTER TABLE work_logs ADD COLUMN task_id INTEGER REFERENCES project_tasks(id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_work_logs_task ON work_logs(task_id,work_date)")
-                conn.execute("PRAGMA user_version = 3")
+                conn.execute("PRAGMA user_version = 5")
             self._initialized = True
 
     @contextmanager
@@ -94,6 +86,47 @@ class Database(TaskRepository):
     @staticmethod
     def _rows(rows) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
+
+    def list_todos(self):
+        with self._connection() as conn:
+            return self._rows(conn.execute("""SELECT t.*,p.name AS project_name,p.deleted_at AS project_deleted_at
+                FROM project_todos t LEFT JOIN projects p ON p.id=t.project_id
+                WHERE t.deleted_at IS NULL ORDER BY (t.status='已完成'),t.updated_at DESC,t.id DESC"""))
+
+    def save_todo(self, payload):
+        todo_id = parse_id(payload["id"]) if payload.get("id") is not None else None
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT * FROM project_todos WHERE id=? AND deleted_at IS NULL", (todo_id,)).fetchone() if todo_id else None
+            if todo_id and old is None:
+                raise NotFoundError("待办不存在")
+            values = {**(dict(old) if old else {}), **payload}
+            content = required_text(values, "content", 3000)
+            status = values.get("status", "未完成")
+            if status not in ("未完成", "已完成"):
+                raise ValidationError("待办状态只能是未完成或已完成")
+            project_id = parse_id(values["project_id"]) if values.get("project_id") is not None else None
+            if project_id is not None:
+                project = conn.execute("SELECT deleted_at FROM projects WHERE id=?", (project_id,)).fetchone()
+                if not project or (project["deleted_at"] and (not old or old["project_id"] != project_id)):
+                    raise ValidationError("请选择存在的项目")
+            now = _now()
+            completed_at = (old["completed_at"] or now) if old and old["status"] == status == "已完成" else now if status == "已完成" else None
+            if old:
+                conn.execute("UPDATE project_todos SET project_id=?,content=?,status=?,completed_at=?,updated_at=? WHERE id=?",
+                    (project_id,content,status,completed_at,now,todo_id))
+            else:
+                todo_id = conn.execute("INSERT INTO project_todos(project_id,content,status,completed_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (project_id,content,status,completed_at,now,now)).lastrowid
+            return dict(conn.execute("SELECT * FROM project_todos WHERE id=?", (todo_id,)).fetchone())
+
+    def delete_todo(self, todo_id):
+        todo_id = parse_id(todo_id)
+        with self._connection() as conn:
+            now = _now()
+            result = conn.execute("UPDATE project_todos SET deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL", (now,now,todo_id))
+            if not result.rowcount:
+                raise NotFoundError("待办不存在")
 
     def dashboard(self) -> dict[str, Any]:
         today = _today().isoformat()
@@ -122,142 +155,6 @@ class Database(TaskRepository):
             "time_off": sum(row["time_off_days"] for row in attendance_rows),
         }
         return {"metrics": metrics, "recent_projects": recent, "attendance": attendance}
-
-    def list_todos(self) -> list[dict[str, Any]]:
-        with self._connection() as conn:
-            return [self._todo_row(row) for row in conn.execute(
-                """SELECT t.*,p.name AS project_name,p.deleted_at AS project_deleted_at
-                FROM todos t JOIN projects p ON p.id=t.project_id
-                WHERE t.deleted_at IS NULL ORDER BY t.id DESC"""
-            )]
-
-    def save_todo(self, payload: dict[str, Any]) -> dict[str, Any]:
-        todo_id = parse_id(payload["id"]) if payload.get("id") is not None else None
-        project_id = parse_id(payload.get("project_id"), "project_id")
-        content = required_text(payload, "content", 3000)
-        enabled = payload.get("push_enabled", False)
-        if not isinstance(enabled, bool):
-            raise ValidationError("push_enabled 必须是布尔值")
-        mode = payload.get("push_mode", "once")
-        if mode not in ("once", "weekly"):
-            raise ValidationError("无效的推送模式")
-        days, clock, offset = [], "", 480
-        push_at = push_due = None
-        if mode == "weekly":
-            days, clock, offset = weekly_values(payload)
-            push_due = next_weekly(time.time(), days, clock, offset)
-        elif payload.get("push_at"):
-            try:
-                parsed = datetime.fromisoformat(str(payload["push_at"]))
-                if parsed.tzinfo is None:
-                    raise ValueError
-                parsed = parsed.astimezone(timezone.utc)
-                push_at = parsed.isoformat(timespec="seconds")
-                push_due = parsed.timestamp()
-            except (ValueError, TypeError, OverflowError) as exc:
-                raise ValidationError("推送时间必须包含日期、时间和时区") from exc
-        if enabled and push_due is None:
-            raise ValidationError("开启推送后必须设置推送时间")
-        now = _now()
-        with self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            old = self._editable_todo(conn, todo_id) if todo_id is not None else None
-            project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
-            if not project or (project["deleted_at"] and (not old or old["project_id"] != project_id)):
-                raise ValidationError("请选择存在的项目")
-            if enabled and project["deleted_at"]:
-                raise ValidationError("所属项目已删除，请关闭推送或选择其他项目")
-            reset = not old or any((
-                old["push_at"] != push_at, bool(old["push_enabled"]) != enabled,
-                old["push_mode"] != mode, json.loads(old["push_weekdays"]) != days,
-                old["push_time"] != clock, old["push_utc_offset"] != offset,
-            ))
-            if old and not reset:
-                push_due = old["push_due"]
-            if old:
-                conn.execute(
-                    """UPDATE todos SET project_id=?,content=?,push_enabled=?,push_at=?,push_due=?,
-                    push_mode=?,push_weekdays=?,push_time=?,push_utc_offset=?,
-                    sent_at=CASE WHEN ? THEN NULL ELSE sent_at END,
-                    push_error=CASE WHEN ? THEN '' ELSE push_error END,
-                    retry_at=CASE WHEN ? THEN 0 ELSE retry_at END,
-                    claim_token=NULL,claimed_until=0,updated_at=? WHERE id=?""",
-                    (project_id, content, int(enabled), push_at, push_due, mode, json.dumps(days), clock, offset,
-                     reset, reset, reset, now, todo_id),
-                )
-            else:
-                todo_id = conn.execute(
-                    """INSERT INTO todos(project_id,content,push_enabled,push_at,push_due,
-                    push_mode,push_weekdays,push_time,push_utc_offset,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (project_id, content, int(enabled), push_at, push_due, mode, json.dumps(days), clock, offset, now, now),
-                ).lastrowid
-            return self._todo_row(conn.execute("SELECT * FROM todos WHERE id=?", (todo_id,)).fetchone())
-
-    @staticmethod
-    def _todo_row(row) -> dict[str, Any]:
-        result = dict(row)
-        result["push_weekdays"] = json.loads(result["push_weekdays"])
-        return result
-
-    @staticmethod
-    def _editable_todo(conn: sqlite3.Connection, todo_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM todos WHERE id=? AND deleted_at IS NULL", (todo_id,)).fetchone()
-        if not row:
-            raise NotFoundError("待办不存在")
-        if row["claimed_until"] > time.time():
-            raise ValidationError("该待办正在推送，请稍后再操作")
-        return row
-
-    def delete_todo(self, todo_id: Any) -> None:
-        todo_id = parse_id(todo_id)
-        with self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            self._editable_todo(conn, todo_id)
-            now = _now()
-            conn.execute("UPDATE todos SET deleted_at=?,updated_at=?,claim_token=NULL,claimed_until=0 WHERE id=?", (now, now, todo_id))
-
-    def claim_due_todo(self, now: float | None = None) -> dict[str, Any] | None:
-        """Reserve one reminder durably; an interrupted worker's lease expires."""
-        now = time.time() if now is None else now
-        with self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # Skip missed calendar days rather than replaying a backlog of alarms.
-            for overdue in conn.execute(
-                """SELECT * FROM todos WHERE push_mode='weekly' AND push_enabled=1
-                AND deleted_at IS NULL AND push_due<=? AND claimed_until<=?""", (now, now)
-            ).fetchall():
-                zone = timezone(timedelta(minutes=overdue["push_utc_offset"]))
-                if datetime.fromtimestamp(overdue["push_due"], zone).date() < datetime.fromtimestamp(now, zone).date():
-                    due = next_weekly(now - 1, json.loads(overdue["push_weekdays"]), overdue["push_time"], overdue["push_utc_offset"])
-                    conn.execute("UPDATE todos SET push_due=?,retry_at=0,push_error='' WHERE id=?", (due, overdue["id"]))
-            row = conn.execute(
-                """SELECT t.*,p.name AS project_name FROM todos t JOIN projects p ON p.id=t.project_id
-                WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL
-                AND t.push_enabled=1 AND (t.push_mode='weekly' OR t.sent_at IS NULL)
-                AND t.push_due<=? AND t.retry_at<=? AND t.claimed_until<=?
-                ORDER BY t.push_due,t.id LIMIT 1""", (now, now, now),
-            ).fetchone()
-            if not row:
-                return None
-            token = uuid.uuid4().hex
-            conn.execute("UPDATE todos SET claim_token=?,claimed_until=? WHERE id=?", (token, now + 120, row["id"]))
-            return {**dict(row), "claim_token": token}
-
-    def finish_todo_push(self, todo_id: int, token: str, error: str = "") -> None:
-        with self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM todos WHERE id=? AND claim_token=?", (todo_id, token)).fetchone()
-            if not row:
-                return
-            due = row["push_due"]
-            if not error and row["push_mode"] == "weekly":
-                due = next_weekly(max(time.time(), due), json.loads(row["push_weekdays"]), row["push_time"], row["push_utc_offset"])
-            conn.execute(
-                """UPDATE todos SET sent_at=?,push_due=?,push_error=?,retry_at=?,claim_token=NULL,claimed_until=0
-                WHERE id=? AND claim_token=?""",
-                (row["sent_at"] if error else _now(), due, error[:500], time.time() + 60 if error else 0, todo_id, token),
-            )
 
     def list_members(self) -> list[dict[str, Any]]:
         with self._connection() as conn:
@@ -1215,17 +1112,14 @@ CREATE TABLE IF NOT EXISTS team_daily_summaries (
 
 """
 
-TODO_SCHEMA = """
-CREATE TABLE IF NOT EXISTS todos (
- id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
- content TEXT NOT NULL,
- push_enabled INTEGER NOT NULL DEFAULT 0 CHECK(push_enabled IN (0,1)), push_at TEXT, push_due REAL,
- push_mode TEXT NOT NULL DEFAULT 'once' CHECK(push_mode IN ('once','weekly')),
- push_weekdays TEXT NOT NULL DEFAULT '[]', push_time TEXT NOT NULL DEFAULT '',
- push_utc_offset INTEGER NOT NULL DEFAULT 480,
- sent_at TEXT, push_error TEXT NOT NULL DEFAULT '', retry_at REAL NOT NULL DEFAULT 0,
- claim_token TEXT, claimed_until REAL NOT NULL DEFAULT 0,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+SCHEMA += TASK_SCHEMA
+
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS project_todos (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ project_id INTEGER REFERENCES projects(id), content TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT '未完成' CHECK(status IN ('未完成','已完成')),
+ completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_project_todos_status ON project_todos(deleted_at,status,project_id);
 """
-SCHEMA += TODO_SCHEMA + TASK_SCHEMA

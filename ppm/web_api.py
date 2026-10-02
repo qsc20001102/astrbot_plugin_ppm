@@ -1,29 +1,53 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import hashlib
+import json
+import time
+import re
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any
 
-from astrbot.api import logger
-from astrbot.api.web import error_response, json_response, request
+import logging
+from aiohttp import web
+
+logger = logging.getLogger(__name__)
+
+def json_response(data):
+    return web.json_response({"data": data})
+
+def error_response(message, status_code=400):
+    return web.json_response({"error": message}, status=status_code)
 
 from .database import Database
 from .errors import NotFoundError, ValidationError
 from .validation import parse_date
+from .llm import ModelClient
+from .summary_prompts import RULES, TEMPLATES
 
 
 class WebApi:
-    """Thin AstrBot Page API adapter; business rules stay in Database."""
+    """Standalone HTTP API; business rules stay in Database."""
 
-    def __init__(self, database: Database, context: Any, config: dict[str, Any]):
+    def __init__(self, database: Database, config, model):
         self.db = database
-        self.context = context
+        self.model = model
         self.config = config
 
-    def register(self, plugin_name: str) -> None:
-        routes: list[tuple[str, Callable[..., Awaitable[Any]], list[str], str]] = [
+    def register(self, app) -> None:
+        routes = [
+            ("ai/preview", self.summary_preview, ["POST"], "Preview summary inputs"),
+            ("ai/templates", self.summary_templates, ["GET"], "Summary templates"),
+            ("settings/diagnose", self.diagnose_model, ["POST"], "Diagnose saved model"),
+            ("settings", self.settings, ["GET"], "Settings"),
+            ("settings/save", self.save_settings, ["POST"], "Save settings"),
+            ("settings/test", self.test_model, ["POST"], "Test saved model"),
+            ("settings/models", self.list_models, ["POST"], "Discover available models"),
+            ("todos", self.todos, ["GET"], "List notes and completion state"),
+            ("todos/save", self.save_todo, ["POST"], "Save todo"),
+            ("todos/delete", self.delete_todo, ["POST"], "Delete todo"),
             ("health", self.health, ["GET"], "PPM health"),
             ("dashboard", self.dashboard, ["GET"], "PPM dashboard"),
             ("members", self.members, ["GET"], "List team members"),
@@ -33,9 +57,6 @@ class WebApi:
             ("tasks", self.tasks, ["GET"], "Project tasks and lifecycle history"),
             ("tasks/save", self.save_task, ["POST"], "Create or update project task"),
             ("tasks/delete", self.delete_task, ["POST"], "Soft delete project task"),
-            ("todos", self.todos, ["GET"], "List project todos and reminder status"),
-            ("todos/save", self.save_todo, ["POST"], "Create or update todo"),
-            ("todos/delete", self.delete_todo, ["POST"], "Delete todo"),
             ("projects/save", self.save_project, ["POST"], "Create or update project"),
             ("projects/delete", self.delete_project, ["POST"], "Delete project"),
             (
@@ -125,23 +146,25 @@ class WebApi:
             ),
         ]
         for endpoint, handler, methods, description in routes:
-            self.context.register_web_api(
-                f"/{plugin_name}/{endpoint}", self._guard(handler), methods, description
-            )
+            for method in methods:
+                app.router.add_route(method, f"/api/{endpoint}", self._guard(handler))
 
     @staticmethod
     def _guard(handler):
         @wraps(handler)
-        async def guarded():
+        async def guarded(request):
             try:
-                return await handler()
+                return await handler(request)
             except ValidationError as exc:
                 return error_response(str(exc), status_code=400)
         return guarded
 
     @staticmethod
-    async def _payload() -> dict[str, Any]:
-        payload = await request.json(default={})
+    async def _payload(request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValidationError("请求内容必须是有效 JSON") from exc
         if not isinstance(payload, dict):
             raise ValidationError("请求内容必须是 JSON 对象")
         return payload
@@ -153,105 +176,125 @@ class WebApi:
             return error_response(str(exc), status_code=400)
         except NotFoundError as exc:
             return error_response(str(exc), status_code=404)
-        except Exception as exc:  # noqa: BLE001 - Page API must isolate plugin failures
+        except Exception:  # Keep unexpected internal errors out of HTTP responses.
             logger.exception("PPM Page API request failed")
-            return error_response(f"操作失败：{exc}", status_code=500)
+            return error_response("操作失败，请查看服务日志", status_code=500)
 
-    async def health(self):
+    async def health(self, request):
         return json_response({"ok": True, "version": 1, "settings": {
             "week_start": "sunday" if self.config.get("week_start") == "sunday" else "monday",
             "ui_color_theme": self.config.get("ui_color_theme") if self.config.get("ui_color_theme") in ("forest", "ocean", "violet", "amber") else "forest",
         }})
 
-    async def dashboard(self):
+    async def settings(self, request):
+        return json_response(self.config.public())
+
+    async def save_settings(self, request):
+        payload = await self._payload(request)
+        return json_response(self.config.save(payload))
+
+    async def test_model(self, request):
+        await self._payload(request)
+        return json_response({"reply": await self.model.generate("请只回复：连接成功")})
+
+    async def list_models(self, request):
+        payload = await self._payload(request)
+        config = self.config.resolve({k: payload[k] for k in
+            ("ai_base_url", "ai_api_key", "ai_timeout", "clear_api_key") if k in payload})
+        if (config["ai_base_url"].rstrip("/") != self.config["ai_base_url"].rstrip("/")
+                and self.config.get("ai_api_key") and "ai_api_key" not in payload
+                and payload.get("clear_api_key") is not True):
+            raise ValidationError("API 地址已更改，请填写该服务的密钥；免密服务请明确填写空密钥")
+        return json_response({"models": await ModelClient(config).list_models()})
+
+    async def todos(self, request):
+        return await self._run(self.db.list_todos)
+
+    async def save_todo(self, request):
+        payload = await self._payload(request)
+        return await self._run(lambda: self.db.save_todo(payload))
+
+    async def delete_todo(self, request):
+        payload = await self._payload(request)
+        return await self._run(lambda: self._deleted(self.db.delete_todo, payload.get("id")))
+
+    async def dashboard(self, request):
         return await self._run(self.db.dashboard)
 
-    async def members(self):
+    async def members(self, request):
         return await self._run(lambda: self.db.list_members())
 
-    async def save_member(self):
-        payload = await self._payload()
+    async def save_member(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self.db.save_member(payload))
 
-    async def delete_member(self):
-        payload = await self._payload()
+    async def delete_member(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted(self.db.delete_member, payload.get("id"))
         )
 
-    async def projects(self):
+    async def projects(self, request):
         summary_date = request.query.get("summary_date")
         if summary_date is not None:
             return await self._run(lambda: self.db.summary_projects(summary_date))
         return await self._run(lambda: self.db.list_projects())
 
-    async def tasks(self):
+    async def tasks(self, request):
         return await self._run(lambda: self.db.list_tasks(request.query.get("project_id")))
 
-    async def save_task(self):
-        payload = await self._payload()
+    async def save_task(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self.db.save_task(payload))
 
-    async def delete_task(self):
-        payload = await self._payload()
+    async def delete_task(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self._deleted_pair(self.db.delete_task, payload.get("id"), payload.get("project_id")))
 
-    async def todos(self):
-        configured = bool(str(self.config.get("todo_push_session", "") or "").strip())
-        return await self._run(lambda: {"todos": self.db.list_todos(), "push_configured": configured})
-
-    async def save_todo(self):
-        payload = await self._payload()
-        return await self._run(lambda: self.db.save_todo(payload))
-
-    async def delete_todo(self):
-        payload = await self._payload()
-        return await self._run(lambda: self._deleted(self.db.delete_todo, payload.get("id")))
-
-    async def save_project(self):
-        payload = await self._payload()
+    async def save_project(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self.db.save_project(payload))
 
-    async def delete_project(self):
-        payload = await self._payload()
+    async def delete_project(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted(self.db.delete_project, payload.get("id"))
         )
 
-    async def project_detail(self):
+    async def project_detail(self, request):
         return await self._run(lambda: self.db.project_detail(request.query.get("id")))
 
-    async def save_work_log(self):
-        payload = await self._payload()
+    async def save_work_log(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self.db.save_work_log(payload))
 
-    async def work_logs(self):
+    async def work_logs(self, request):
         return await self._run(
             lambda: self.db.list_work_logs(
                 request.query.get("project_id"), request.query.get("date")
             )
         )
 
-    async def delete_work_log(self):
-        payload = await self._payload()
+    async def delete_work_log(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted(self.db.delete_work_log, payload.get("id"))
         )
 
-    async def save_status_history(self):
-        payload = await self._payload()
+    async def save_status_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._saved(self.db.update_status_history, payload)
         )
 
-    async def add_status_history(self):
-        payload = await self._payload()
+    async def add_status_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._saved(self.db.insert_status_history, payload)
         )
 
-    async def delete_status_history(self):
-        payload = await self._payload()
+    async def delete_status_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted_pair(
                 self.db.delete_status_history,
@@ -260,20 +303,20 @@ class WebApi:
             )
         )
 
-    async def save_membership_history(self):
-        payload = await self._payload()
+    async def save_membership_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._saved(self.db.update_membership_history, payload)
         )
 
-    async def add_membership_history(self):
-        payload = await self._payload()
+    async def add_membership_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._saved(self.db.insert_membership_history, payload)
         )
 
-    async def delete_membership_history(self):
-        payload = await self._payload()
+    async def delete_membership_history(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted_pair(
                 self.db.delete_membership_history,
@@ -282,86 +325,133 @@ class WebApi:
             )
         )
 
-    async def timeline(self):
+    async def timeline(self, request):
         today = _today()
         start = request.query.get("start") or (today - timedelta(days=6)).isoformat()
         end = request.query.get("end") or today.isoformat()
         return await self._run(lambda: self.db.timeline(start, end))
 
-    async def calendar(self):
+    async def calendar(self, request):
         month = request.query.get("month") or _today().strftime("%Y-%m")
         return await self._run(lambda: self.db.get_calendar(month))
 
-    async def save_calendar(self):
-        payload = await self._payload()
+    async def save_calendar(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self._saved(self.db.save_calendar_day, payload))
 
-    async def attendance(self):
+    async def attendance(self, request):
         month = request.query.get("month") or _today().strftime("%Y-%m")
         return await self._run(lambda: self.db.attendance_matrix(month))
 
-    async def save_attendance(self):
-        payload = await self._payload()
+    async def save_attendance(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self._saved(self.db.save_attendance, payload))
 
-    async def attendance_summary(self):
+    async def attendance_summary(self, request):
         today = _today()
         start = request.query.get("start") or today.replace(day=1).isoformat()
         end = request.query.get("end") or today.isoformat()
         return await self._run(lambda: self.db.attendance_summary(start, end))
 
-    async def generate_summary(
-        self,
-        project_ids: Any,
-        summary_date: Any,
-        history_days: Any = 1,
-        *,
-        overwrite: bool = False,
-    ) -> dict[str, Any]:
-        """Generate a summary and optionally persist it for the given date."""
-        provider_id = str(self.config.get("ai_provider_id", "")).strip()
-        if not provider_id:
-            raise ValidationError("请先在插件配置中选择日报总结模型")
-        summary_date = parse_date(summary_date, "summary_date")
-        project_ids, material = await asyncio.to_thread(
-            self.db.team_summary_material, project_ids, summary_date, history_days
-        )
-        rules = (
-            "日报资料按项目和任务分组。只把当日记录视为当日工作；任务状态、任务变更、完成日期和记录文字须分别解读。"
-            "任务状态按截至总结日期的最后历史快照还原，缺少当日快照时不可推断状态或进度。"
-            "已完成任务不一定在当天完成；重新打开、删除或补录历史完成日期不代表当天产出。"
-            "无当天记录的任务仅供背景参考，未完成任务不自动成为明日承诺。项目级记录同样需要归纳。"
-            "历史日报只用于衔接，不能当作今日工作；不得虚构未提供的风险、计划或成果。"
-        )
-        prompt = f"{self.config.get('ai_summary_prompt', '')}\n\n资料解读规则：{rules}\n\n以下是项目资料：\n{material}"
-        content = await self._generate_text(provider_id, prompt)
-        persisted = await asyncio.to_thread(
-            self.db.save_team_summary,
-            project_ids,
-            summary_date,
-            provider_id,
-            content,
-            overwrite=overwrite,
-        )
-        return {
-            "content": content,
-            "date": summary_date,
-            "project_ids": project_ids,
-            "persisted": persisted,
-        }
+    async def summary_templates(self, request):
+        return json_response(TEMPLATES)
 
-    async def _generate_text(self, provider_id: str, prompt: str) -> str:
-        response = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=prompt,
-        )
-        content = response.completion_text
-        if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("模型返回了空内容")
-        return content.strip()
+    async def prepare_summary(self, project_ids, summary_date, history_days=1, *, period="daily", template="custom"):
+        config = dict(self.config)
+        if not config.get("ai_model"):
+            raise ValidationError("请先在模型配置中填写日报总结模型")
+        if period not in ("daily", "weekly") or template not in ("custom", *TEMPLATES):
+            raise ValidationError("无效的汇报类型或模板")
+        end = parse_date(summary_date, "summary_date")
+        end_day = datetime.strptime(end, "%Y-%m-%d").date()
+        start_day = end_day - timedelta(days=6 if period == "weekly" else 0)
+        project_ids, end_material = await asyncio.to_thread(self.db.team_summary_material,
+            project_ids, end, history_days if period == "daily" else 0)
+        parts = []
+        for offset in range((end_day - start_day).days + 1):
+            day = (start_day + timedelta(days=offset)).isoformat()
+            if day == end:
+                material = end_material
+            else:
+                available = await asyncio.to_thread(self.db.summary_projects, day)
+                day_ids = [p["id"] for p in available if p["id"] in project_ids]
+                if not day_ids:
+                    parts.append(f"日期：{day}：所选项目尚无历史档案。")
+                    continue
+                _, material = await asyncio.to_thread(self.db.team_summary_material, day_ids, day, 0)
+            parts.append(f"日期：{day}\n{material}")
+        writing = config.get("ai_summary_prompt", "") if template == "custom" else TEMPLATES[template]["prompt"]
+        system_prompt = f"资料解读规则：{RULES}\n\n写作要求：\n{writing}"
+        material = f"汇报范围：{start_day.isoformat()} 至 {end}\n\n" + "\n\n".join(parts)
+        body = ModelClient.completion_body(config, material, system_prompt)
+        # Include credentials only in the fingerprint input, never in the public preview.
+        fingerprint = hashlib.sha256(json.dumps({"config": config, "body": body},
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        preview = {"model": config["ai_model"], "endpoint": config["ai_base_url"].rstrip("/") + "/chat/completions",
+            "start": start_day.isoformat(), "date": end, "period": period, "template": template,
+            "history_days": history_days if period == "daily" else 0,
+            "project_ids": project_ids, "writing_prompt": writing, "rules": RULES,
+            "material": material, "request": body, "fingerprint": fingerprint}
+        return config, preview
 
-    async def ai_summary(self):
-        payload = await self._payload()
+    async def summary_preview(self, request):
+        payload = await self._payload(request)
+        _, preview = await self.prepare_summary(payload.get("project_ids"), payload.get("date") or _today().isoformat(),
+            payload.get("history_days", 1), period=payload.get("period", "daily"), template=payload.get("template", "custom"))
+        return json_response(preview)
+
+    async def generate_summary(self, project_ids, summary_date, history_days=1, *, overwrite=False,
+                               period="daily", template="custom", fingerprint=None):
+        config, preview = await self.prepare_summary(project_ids, summary_date, history_days, period=period, template=template)
+        if fingerprint is not None and fingerprint != preview["fingerprint"]:
+            raise ValidationError("模型配置或工作资料已变化，请重新核对资料后生成")
+        # Snapshot guarantees the model and instructions match the reviewed inputs.
+        content = await ModelClient(config).generate(preview["material"], system_prompt=preview["request"]["messages"][0]["content"])
+        persisted = False
+        if period == "daily":
+            persisted = await asyncio.to_thread(self.db.save_team_summary, preview["project_ids"], preview["date"],
+                config["ai_model"], content, overwrite=overwrite)
+        return {"content": content, "date": preview["date"], "start": preview["start"], "period": period,
+                "project_ids": preview["project_ids"], "persisted": persisted,
+                "model": config["ai_model"], "fingerprint": preview["fingerprint"]}
+
+    async def diagnose_model(self, request):
+        payload = await self._payload(request)
+        kind = payload.get("kind", "generation")
+        if kind not in ("models", "generation"):
+            raise ValidationError("请选择模型列表或文本生成诊断")
+        config = dict(self.config)
+        client = ModelClient(config)
+        prompt = "请只回复：连接成功"
+        detail = {"kind": kind, "model": config["ai_model"], "ok": False, "http_status": None,
+            "error_code": None, "request_id": None, "retry_after": None,
+            "request": {"method": "GET" if kind == "models" else "POST",
+                "url": config["ai_base_url"].rstrip("/") + ("/models" if kind == "models" else "/chat/completions"),
+                "headers": {"Authorization": "Bearer [已隐藏]"} if config.get("ai_api_key") else {},
+                "body": None if kind == "models" else client.completion_body(config, prompt)}}
+        started = time.perf_counter()
+        try:
+            if kind == "models":
+                models = await client.list_models(diagnostics=detail)
+                detail.update({"model_count": len(models), "selected_model_listed": config["ai_model"] in models})
+            else:
+                detail["reply"] = await client.generate(prompt, diagnostics=detail)
+            detail["ok"] = True
+        except ValidationError as exc:
+            detail.update({"error": str(exc), "error_code": getattr(exc, "provider_code", None)})
+        detail["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+        def redact(value):
+            if isinstance(value, dict):
+                return {k: redact(v) for k, v in value.items()}
+            if isinstance(value, str):
+                if config.get("ai_api_key"):
+                    value = value.replace(config["ai_api_key"], "[已隐藏]")
+                return re.sub(r"\bsk-[A-Za-z0-9_-]+", "[已隐藏]", value)
+            return value
+        return json_response(redact(detail))
+
+    async def ai_summary(self, request):
+        payload = await self._payload(request)
         try:
             overwrite = payload.get("overwrite", False)
             if not isinstance(overwrite, bool):
@@ -371,6 +461,8 @@ class WebApi:
                 payload.get("date") or _today().isoformat(),
                 payload.get("history_days", 1),
                 overwrite=overwrite,
+                period=payload.get("period", "daily"), template=payload.get("template", "custom"),
+                fingerprint=payload.get("fingerprint"),
             )
             return json_response(result)
         except (ValidationError, NotFoundError) as exc:
@@ -379,7 +471,7 @@ class WebApi:
             logger.exception("PPM AI summary generation failed")
             return error_response(f"AI 日报生成失败：{exc}", status_code=502)
 
-    async def summaries(self):
+    async def summaries(self, request):
         today = _today()
         return await self._run(
             lambda: self.db.list_team_summaries(
@@ -389,12 +481,12 @@ class WebApi:
             )
         )
 
-    async def save_summary_content(self):
-        payload = await self._payload()
+    async def save_summary_content(self, request):
+        payload = await self._payload(request)
         return await self._run(lambda: self._save_summary(payload))
 
-    async def delete_summary(self):
-        payload = await self._payload()
+    async def delete_summary(self, request):
+        payload = await self._payload(request)
         return await self._run(
             lambda: self._deleted(
                 self.db.delete_team_summary,
@@ -414,7 +506,7 @@ class WebApi:
         self.db.save_team_summary(
             project_ids,
             summary_date,
-            str(self.config.get("ai_provider_id", "")).strip(),
+            str(self.config.get("ai_model", "")).strip(),
             payload.get("content"),
             overwrite=True,
         )

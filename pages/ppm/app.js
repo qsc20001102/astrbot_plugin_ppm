@@ -1,3 +1,4 @@
+import { setupTodos } from "./todos.js";
 import { progressMeter, logTaskLabel, taskOverview } from "./tasks.js";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -8,18 +9,20 @@ const monthIso = d => iso(d).slice(0, 7);
 const fmt = value => value ? new Date(value).toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—";
 const statusClass = value => `status status-${esc(value)}`;
 
-const state = {view:"projects", members:[], projects:[], todos:[], todoPushConfigured:false, attendance:null, summary:null, timeline:null, summaryTimeline:null, selectedProject:null, summaryPreview:null, projectLogRange:null, detailTab:"overview", taskFilter:"all", taskKeyword:"", expandedTasks:new Set()};
-const bridge = window.AstrBotPluginPage;
-const api = bridge ? {
-  get: (endpoint, params) => bridge.apiGet(endpoint, params),
-  post: (endpoint, body) => bridge.apiPost(endpoint, body),
-} : createDemoApi();
-
-const settings = {week_start:"monday",ui_color_theme:"forest"};
-if (bridge) {
-  await bridge.ready();
-  Object.assign(settings, (await api.get("health")).settings || {});
+const state = {view:"projects", members:[], projects:[],  attendance:null, summary:null, timeline:null, summaryTimeline:null, selectedProject:null, summaryPreview:null, projectLogRange:null, detailTab:"overview", taskFilter:"all", taskKeyword:"", expandedTasks:new Set()};
+async function requestApi(endpoint, options = {}) {
+  const response = await fetch(`/api/${endpoint}`, options);
+  const result = await response.json().catch(() => ({error:"服务返回异常，请刷新页面或检查服务日志"}));
+  if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  return result.data;
 }
+const api = {
+  get: (endpoint, params) => requestApi(endpoint + (params ? `?${new URLSearchParams(params)}` : "")),
+  post: (endpoint, body) => requestApi(endpoint, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}),
+};
+const settings = {week_start:"monday",ui_color_theme:"forest"};
+try { Object.assign(settings, (await api.get("health")).settings || {}); }
+catch (error) { document.body.textContent = "连接服务失败：" + error.message; throw error; }
 document.documentElement.dataset.colorTheme = ["forest","ocean","violet","amber"].includes(settings.ui_color_theme) ? settings.ui_color_theme : "forest";
 $("#today-label").textContent = today.toLocaleDateString("zh-CN", {year:"numeric",month:"long",day:"numeric",weekday:"short"});
 $("#attendance-month").value = monthIso(today);
@@ -33,7 +36,9 @@ const viewMeta = {
   attendance:["考勤管理","公司日历、成员考勤与周期汇总","登记考勤"],
   projects:["项目列表","每一步有迹可循，让进度清晰可见","新建项目"],
   "project-records":["项目记录","每日总结与项目工作进程","生成每日总结"],
-  todos:["待办事项","关联项目，设置一次性或周期提醒","新增待办"],
+  models:["模型配置","连接模型服务，管理日报使用的模型","保存模型配置"],
+  settings:["系统配置","界面色调与日历偏好","保存系统配置"],
+  todos:["待办记录","随手记录，按项目整理，完成后勾选","新增待办"],
 };
 
 let loadingCount = 0;
@@ -50,9 +55,28 @@ function toast(message, error = false) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.add("hidden"), 2600);
 }
 
+const mobileNavigationQuery = window.matchMedia("(max-width: 640px)");
+function setMobileNavigation(open) {
+  const mobile = mobileNavigationQuery.matches;
+  const expanded = mobile && open;
+  document.body.classList.toggle("navigation-open", expanded);
+  $("#menu-toggle").setAttribute("aria-expanded", String(expanded));
+  $("#navigation-backdrop").hidden = !expanded;
+  $("main").inert = expanded;
+  $("#app-navigation").inert = mobile && !expanded;
+  if (expanded) $("#close-navigation").focus();
+  else if (mobile && $("#app-navigation").contains(document.activeElement)) $("#menu-toggle").focus();
+}
+$("#menu-toggle").addEventListener("click", () => setMobileNavigation(true));
+$("#close-navigation").addEventListener("click", () => setMobileNavigation(false));
+$("#navigation-backdrop").addEventListener("click", () => setMobileNavigation(false));
+mobileNavigationQuery.addEventListener("change", () => setMobileNavigation(false));
+setMobileNavigation(false);
+
 let navigationVersion = 0;
 async function switchView(view) {
   navigationVersion++;
+  setMobileNavigation(false);
   closeDrawer();
   state.view = view;
   window.scrollTo(0, 0);
@@ -81,98 +105,126 @@ async function loadView(view) {
     if (view === "attendance") { await loadAttendance(); }
     if (view === "projects") { await loadProjects(); }
     if (view === "project-records") { await Promise.all([loadTimeline(), loadSummaries()]); }
-    if (view === "todos") { await loadTodos(); }
+    if (view === "settings" || view === "models") { await loadSettings(view); }
+    if (view === "todos") { await todoUI.load(); }
   });
 }
 
-const todoWeekLabels = ["周一","周二","周三","周四","周五","周六","周日"];
-function todoZone(offset) { return `UTC${offset >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(offset)/60)).padStart(2,"0")}:${String(Math.abs(offset)%60).padStart(2,"0")}`; }
-function todoScheduleLabel(todo) {
-  if (todo.push_mode !== "weekly") return `一次性 · ${todoTime(todo.push_at)}`;
-  const days = todo.push_weekdays || [];
-  return `${days.length === 7 ? "每天" : days.map(day=>todoWeekLabels[day]).join("、")} ${todo.push_time}（${todoZone(todo.push_utc_offset)}）`;
+const todoUI = setupTodos({api,esc,withLoading,toast,openModal,closeModal,confirmAction});
+let promptTemplates = {}, lastDiagnostics = null;
+let modelListVersion = 0, savedModels = [], settingsBusy = false;
+function resetModels(message = "连接配置已更改，请重新获取模型列表") {
+  modelListVersion++;
+  $("#available-models").replaceChildren(new Option("获取后选择模型", ""));
+  $("#available-models").disabled = true; $("#add-model").disabled = true;
+  $("#models-status").textContent = message;
 }
-const todoTime = value => value ? new Date(value).toLocaleString("zh-CN", {year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}) : "未设置时间";
-let todoLoadVersion = 0;
-async function loadTodos() {
-  const version = ++todoLoadVersion, data = await api.get("todos");
-  if (version !== todoLoadVersion) return;
-  state.todos = data.todos;
-  state.todoPushConfigured = data.push_configured;
-  const filter = $("#todo-project-filter"), selected = filter.value;
-  const projects = [...new Map(state.todos.map(todo => [todo.project_id, todo.project_name])).entries()];
-  filter.innerHTML = `<option value="">全部项目</option>` + projects.map(([id,name]) => `<option value="${id}">${esc(name)}</option>`).join("");
-  if (projects.some(([id]) => String(id) === selected)) filter.value = selected;
-  renderTodos();
+function renderSavedModels() {
+  const current = $("#model-form").elements.ai_model.value;
+  $("#saved-models").innerHTML = savedModels.map(id => `<div class="saved-model"><button type="button" class="${id === current ? "primary" : "secondary"}" data-use-model="${esc(id)}">${esc(id)}${id === current ? " · 当前使用" : ""}</button><button type="button" class="text-action danger" data-remove-model="${esc(id)}" aria-label="移除 ${esc(id)}">移除</button></div>`).join("") || '<small>暂无模型，可从服务商列表添加或手动填写模型名称后保存。</small>';
 }
-function todoPushLabel(todo) {
-  if (!todo.push_enabled) return "未开启";
-  if (todo.sent_at && todo.push_mode !== "weekly") return "已推送";
-  if (todo.project_deleted_at) return "项目已删除，停止推送";
-  if (!state.todoPushConfigured) return "待配置推送会话";
-  if (todo.claimed_until * 1000 > Date.now()) return "推送中";
-  if (todo.push_error) return "推送失败，等待重试";
-  return todo.push_due * 1000 <= Date.now() ? "已到期，等待推送" : "等待推送";
+async function loadSettings(view = state.view) {
+  const config = await api.get("settings"), form = $(view === "models" ? "#model-form" : "#settings-form");
+  for (const [key,value] of Object.entries(config)) if (form.elements[key]) form.elements[key].value = value;
+  if (view === "models") {
+    promptTemplates = await api.get("ai/templates");
+    $("#prompt-template").replaceChildren(new Option("选择模板", ""), ...Object.entries(promptTemplates).map(([id,t])=>new Option(t.name,id)));
+    resetModels("填写地址和密钥后获取模型列表，选择后点击“添加并使用”。");
+    savedModels = [...new Set([...(config.ai_models || []), ...(config.ai_model ? [config.ai_model] : [])])];
+    $("#key-status").textContent = "已保存的密钥直接显示；删除内容并保存即可清除。本地免密服务可留空。";
+    renderSavedModels();
+  }
 }
-function renderTodos() {
-  const notice = $("#todo-push-notice");
-  notice.classList.toggle("needs-config", !state.todoPushConfigured);
-  notice.textContent = state.todoPushConfigured
-    ? "推送会话已配置。支持一次性和周期推送；周期推送按选定星期的固定时间提醒，全选即每天。"
-    : "尚未配置推送会话：请在插件配置中填写「待办推送会话 ID（UMO）」并重载插件。待办仍可保存，提醒将在配置后发送。";
-  const keyword = $("#todo-search").value.trim().toLowerCase(), projectId = $("#todo-project-filter").value;
-  const items = state.todos.filter(todo => (!projectId || String(todo.project_id) === projectId) && `${todo.content} ${todo.project_name}`.toLowerCase().includes(keyword));
-  $("#todos-body").innerHTML = items.map(todo => `<tr data-todo="${todo.id}">
-    <td><div class="todo-content">${esc(todo.content)}</div><small>#${todo.id} · 更新于 ${esc(todoTime(todo.updated_at))}</small></td>
-    <td>${esc(todo.project_name)}<small>项目 ID：${todo.project_id}${todo.project_deleted_at ? " · 已删除" : ""}</small></td>
-    <td><strong class="${todo.push_error ? "push-failed" : ""}">${esc(todoPushLabel(todo))}</strong>
-      ${todo.push_enabled ? `<small>${esc(todoScheduleLabel(todo))}</small>${todo.push_mode === "weekly" ? `<small>下次：${esc(todoTime(new Date(todo.push_due * 1000).toISOString()))}</small>` : ""}` : ""}
-      ${todo.sent_at ? `<small>上次发送：${esc(todoTime(todo.sent_at))}</small>` : ""}
-      ${todo.push_enabled && todo.push_error ? `<small class="push-failed">${esc(todo.push_error)}</small>` : ""}</td>
-    <td><div class="actions"><button class="text-action" data-edit-todo="${todo.id}">编辑</button><button class="text-action danger" data-delete-todo="${todo.id}">删除</button></div></td></tr>`).join("");
-  $("#todos-empty").textContent = state.todos.length ? "没有符合筛选条件的待办" : "暂无待办，点击右上角新增";
-  $("#todos-empty").classList.toggle("hidden", items.length > 0);
+async function saveSettings(view = state.view) {
+  const model = view === "models", form = $(model ? "#model-form" : "#settings-form");
+  if (settingsBusy || !form.reportValidity()) return false;
+  settingsBusy = true;
+  const buttons = [$("#primary-action"), ...$$("button[type=submit]",form)]; buttons.forEach(b=>b.disabled=true);
+  try {
+    const values = Object.fromEntries(new FormData(form));
+    if (model) { values.ai_timeout = Number(values.ai_timeout); values.ai_models = savedModels; }
+    const config = await withLoading(() => api.post("settings/save", values));
+    if (model) { savedModels = config.ai_models || []; renderSavedModels(); }
+    else { Object.assign(settings, values); document.documentElement.dataset.colorTheme = values.ui_color_theme; }
+    toast(model ? "模型配置已保存" : "系统配置已保存"); return true;
+  } finally { settingsBusy=false; buttons.forEach(b=>b.disabled=false); }
 }
-async function todoModal(todo = {}) {
-  const projects = await withLoading(() => api.get("projects"));
-  if (!projects.length && !todo.id) { toast("请先在项目列表中创建项目", true); return; }
-  if (todo.project_deleted_at) projects.push({id:todo.project_id,name:`${todo.project_name}（已删除）`});
-  const projectField = `<label class="field full"><span>所属项目</span><select name="project_id" required><option value="">请选择项目</option>${projects.map(project=>`<option value="${project.id}" ${project.id===todo.project_id ? "selected" : ""}>${esc(project.name)} · #${project.id}</option>`).join("")}</select></label>`;
-  const offset = todo.push_mode === "weekly" ? todo.push_utc_offset : -new Date().getTimezoneOffset();
-  const days = todo.push_weekdays || [];
-  openModal({title:todo.id ? "编辑待办" : "新增待办",description:"像闹钟一样设置提醒：一次性推送，或每周指定几天的固定时间推送。",
-    fields:projectField + textarea("待办内容","content",todo.content||"") +
-      `<label class="field"><span>定时推送</span><span class="todo-push-control"><input type="checkbox" name="push_enabled" ${todo.push_enabled ? "checked" : ""} />开启推送</span></label>` +
-      `<label class="field"><span>推送方式</span><select name="push_mode"><option value="once" ${todo.push_mode !== "weekly" ? "selected" : ""}>一次性推送</option><option value="weekly" ${todo.push_mode === "weekly" ? "selected" : ""}>周期推送</option></select></label>` +
-      `<div class="field full" id="todo-once-fields">${field("推送日期时间（当前浏览器时区）","push_at",todo.push_at ? localDateTime(todo.push_at) : "","datetime-local",true)}</div>` +
-      `<div class="field full" id="todo-weekly-fields"><div class="todo-week-heading"><span>重复星期</span><button type="button" class="text-action" id="todo-select-all">全选（每天）</button></div><div class="todo-weekdays">${todoWeekLabels.map((label,index)=>`<label><input type="checkbox" name="push_weekdays" value="${index}" ${days.includes(index) ? "checked" : ""} />${label}</label>`).join("")}</div>${field("每天固定推送时间","push_time",todo.push_time||"09:00","time",true)}<small class="muted-note">按固定 ${todoZone(offset)} 时区执行。</small></div>` +
-      `<p class="field full muted-note">${state.todoPushConfigured ? "关闭推送可暂停提醒。周期提醒不会补发停机期间往日的历史提醒。" : "尚未配置推送会话，请在插件配置中填写完整 UMO。"}</p>`,
-    onSubmit:async form => {
-      const enabled = form.get("push_enabled") === "on", mode = form.get("push_mode"), at = form.get("push_at");
-      const weekdays = form.getAll("push_weekdays").map(Number);
-      if (mode === "weekly" && !weekdays.length) { toast("请至少选择一个重复星期",true); return; }
-      await withLoading(() => api.post("todos/save", {id:todo.id,project_id:Number(form.get("project_id")),content:form.get("content"),push_enabled:enabled,push_mode:mode,push_at:mode === "once" && at ? new Date(at).toISOString() : null,push_weekdays:weekdays,push_time:form.get("push_time"),push_utc_offset:offset}));
-      closeModal(); toast("待办已保存"); await withLoading(loadTodos); if(state.view==="project-detail")await openProject(state.selectedProject.id);
-    }});
-  const content = $('#modal-form [name="content"]'); content.required = true; content.maxLength = 3000;
-  const toggle = $('#modal-form [name="push_enabled"]'), mode = $('#modal-form [name="push_mode"]');
-  const dateInput = $('#modal-form [name="push_at"]'), timeInput = $('#modal-form [name="push_time"]');
-  const updatePushInput = () => {
-    const weekly = mode.value === "weekly";
-    $("#todo-once-fields").classList.toggle("hidden",weekly); $("#todo-weekly-fields").classList.toggle("hidden",!weekly);
-    dateInput.disabled = weekly; dateInput.required = toggle.checked && !weekly;
-    timeInput.disabled = !weekly; timeInput.required = weekly;
-  };
-  $("#todo-select-all").onclick = () => { $$('[name="push_weekdays"]',$("#modal-form")).forEach(input=>{input.checked=true;}); };
-  toggle.addEventListener("change", updatePushInput); mode.addEventListener("change",updatePushInput); updatePushInput();
+for (const [selector,view] of [["#settings-form","settings"],["#model-form","models"]]) $(selector).addEventListener("submit",event=>{event.preventDefault(); saveSettings(view).catch(()=>{});});
+for (const name of ["ai_base_url", "ai_api_key", "ai_timeout"]) $("#model-form").elements[name].addEventListener("input",()=>resetModels());
+$("#model-form").elements.ai_model.addEventListener("input",renderSavedModels);
+$("#available-models").addEventListener("change",event=>{$("#add-model").disabled=!event.target.value;});
+$("#add-model").addEventListener("click",async()=>{
+  const id=$("#available-models").value; if(!id || settingsBusy)return;
+  const form=$("#model-form"), before=form.elements.ai_model.value;
+  form.elements.ai_model.value=id;
+  try { if(!await saveSettings("models")) form.elements.ai_model.value=before; else $("#models-status").textContent=`已添加并使用 ${id}`; }
+  catch(_) { form.elements.ai_model.value=before; }
+  renderSavedModels();
+});
+$("#saved-models").addEventListener("click",async event=>{
+  const button=event.target.closest("[data-use-model],[data-remove-model]");if(!button || settingsBusy)return;
+  const form=$("#model-form"), previous=form.elements.ai_model.value, previousModels=[...savedModels];
+  if(button.dataset.useModel) form.elements.ai_model.value=button.dataset.useModel;
+  else { savedModels=savedModels.filter(id=>id!==button.dataset.removeModel); if(previous===button.dataset.removeModel)form.elements.ai_model.value=savedModels[0]||""; }
+  try { if(!await saveSettings("models")) {savedModels=previousModels;form.elements.ai_model.value=previous;} }
+  catch(_) {savedModels=previousModels;form.elements.ai_model.value=previous;}
+  renderSavedModels();
+});
+$("#fetch-models").addEventListener("click", async event => {
+  const form = $("#model-form"), button = event.currentTarget;
+  if (!form.elements.ai_base_url.reportValidity() || !form.elements.ai_timeout.reportValidity()) return;
+  resetModels("正在获取模型列表…"); const version = modelListVersion;
+  button.disabled = true; button.textContent = "正在获取…";
+  try {
+    const result = await api.post("settings/models", {ai_base_url:form.elements.ai_base_url.value, ai_api_key:form.elements.ai_api_key.value, ai_timeout:Number(form.elements.ai_timeout.value)});
+    if (version !== modelListVersion) return;
+    const select = $("#available-models");
+    select.replaceChildren(new Option("请选择模型", ""), ...result.models.map(id => new Option(id, id)));
+    select.disabled = !result.models.length;
+    if (result.models.includes(form.elements.ai_model.value)) {select.value=form.elements.ai_model.value;$("#add-model").disabled=false;}
+    $("#models-status").textContent = result.models.length ? `已获取 ${result.models.length} 个模型，选择后可直接添加并使用。` : "服务商返回了空列表，可以手动填写模型名称。";
+  } catch (error) { if (version === modelListVersion) $("#models-status").textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "获取模型列表"; }
+});
+$("#apply-prompt-template").addEventListener("click", async()=>{
+  const template=promptTemplates[$("#prompt-template").value];
+  if(!template) {toast("请先选择模板",true);return;}
+  const input=$("#model-form").elements.ai_summary_prompt;
+  if(input.value.trim() && !await confirmAction("用所选模板替换当前提示词？保存前仍可修改。"))return;
+  input.value=template.prompt; toast("已填入模板，请保存模型配置");
+});
+async function copyText(text) {
+  try { if(navigator.clipboard && window.isSecureContext) {await navigator.clipboard.writeText(text); return;} } catch(_) {}
+  const input=document.createElement("textarea");input.value=text;input.style.position="fixed";input.style.opacity="0";document.body.append(input);input.select();
+  const ok=document.execCommand("copy");input.remove();if(!ok)throw new Error("自动复制不可用，请选中文本手动复制");
 }
+async function diagnose(kind) {
+  const buttons=[$("#test-model"),$("#diagnose-models")];buttons.forEach(b=>b.disabled=true);
+  lastDiagnostics=null;$("#copy-diagnostics").disabled=true;
+  $("#model-test-result").textContent="正在诊断已保存的配置…";
+  try {
+    const result=await api.post("settings/diagnose",{kind});lastDiagnostics=result;$("#copy-diagnostics").disabled=false;
+    const info=result.ok ? (kind==="models" ? `发现 ${result.model_count} 个模型；当前模型${result.selected_model_listed?"在":"不在"}列表中` : result.reply) : result.error;
+    $("#model-test-result").innerHTML=`<p><strong>${kind==="models"?"模型列表":"文本生成"}：${result.ok?"成功":"失败"}</strong> · ${result.elapsed_ms} ms · HTTP ${result.http_status??"未收到响应"}</p><p>${esc(info)}</p><details><summary>查看请求参数和诊断详情（已脱敏）</summary><pre class="diagnostic-json">${esc(JSON.stringify(result,null,2))}</pre></details>`;
+  }catch(error){$("#model-test-result").textContent=error.message;}
+  finally{buttons.forEach(b=>b.disabled=false);}
+}
+$("#test-model").addEventListener("click",()=>diagnose("generation"));
+$("#diagnose-models").addEventListener("click",()=>diagnose("models"));
+$("#copy-diagnostics").addEventListener("click",()=>copyText(JSON.stringify(lastDiagnostics,null,2)).then(()=>toast("脱敏诊断已复制")).catch(e=>toast(e.message,true)));
 
 function metric(label, value, note = "") { return `<div class="metric"><label>${esc(label)}</label><strong>${Number(value || 0)}</strong><small>${esc(note)}</small></div>`; }
+
+function labelTableCells(body) {
+  const labels = $$("thead th", body.closest("table")).map(th => th.textContent);
+  $$("tr", body).forEach(row => [...row.cells].forEach((cell, index) => cell.dataset.label = labels[index] || ""));
+}
 
 function renderMembers() {
   const keyword = $("#member-search").value.trim().toLowerCase();
   const items = state.members.filter(m => [m.name,m.role].join(" ").toLowerCase().includes(keyword));
   $("#members-body").innerHTML = items.map(m => `<tr data-member="${m.id}"><td><div class="member-cell"><span class="member-avatar">${esc(m.name.slice(0,1))}</span><div><strong>${esc(m.name)}</strong><small>${esc(m.role || "未设置岗位")}</small></div></div></td><td>${Number(m.ready_projects||0)}</td><td>${Number(m.active_projects||0)}</td><td>${Number(m.maintenance_projects||0)}</td><td>${Number(m.paused_projects||0)}</td><td>${Number(m.completed_projects||0)}</td><td><div class="actions"><button class="text-action" data-edit-member="${m.id}">编辑</button><button class="text-action danger" data-delete-member="${m.id}">删除</button></div></td></tr>`).join("");
+  labelTableCells($("#members-body"));
   $("#members-empty").classList.toggle("hidden", items.length > 0);
 }
 
@@ -194,6 +246,7 @@ function renderProjects() {
   const statuses = new Set($$("#project-status-filter input:checked").map(input => input.value));
   const items = state.projects.filter(p => statuses.has(p.status) && [p.id,p.name,p.description,p.latest_record_date].join(" ").toLowerCase().includes(keyword));
   $("#projects-body").innerHTML = items.map(p => `<tr data-project="${p.id}"><td><div class="project-cell"><strong>${esc(p.name)}</strong><small>项目ID：${esc(p.id)}</small></div></td><td><span class="${statusClass(p.status)}">${esc(p.status)}</span></td><td>${progressMeter(p)}</td><td>${memberStack(p.members)}</td><td>${esc(p.latest_record_date || "暂无记录")}</td><td>${fmt(p.updated_at)}</td><td><div class="actions"><button class="text-action" data-view-project="${p.id}">详情</button><button class="text-action" data-add-log-for-project="${p.id}">记一笔</button><button class="text-action danger" data-delete-project="${p.id}">删除</button></div></td></tr>`).join("");
+  labelTableCells($("#projects-body"));
   $("#projects-empty").classList.toggle("hidden", items.length > 0);
 }
 function memberStack(members = []) { return `<div class="member-stack">${members.slice(0,4).map(m=>`<span class="mini-avatar" title="${esc(m.name)}">${esc(m.name.slice(0,1))}</span>`).join("")}${members.length>4?`<span class="mini-avatar">+${members.length-4}</span>`:""}${!members.length?"—":""}</div>`; }
@@ -252,12 +305,20 @@ function renderAttendance() {
   const offset = (calendar.days[0].weekday + (settings.week_start === "sunday" ? 1 : 0)) % 7;
   $("#calendar-grid").innerHTML = weekLabels.map(d=>`<div class="calendar-week">${d}</div>`).join("") + (offset ? `<div style="grid-column:span ${offset}"></div>` : "") + calendar.days.map(d=>`<button class="calendar-day ${d.is_workday?"workday":"restday"} ${d.source==="人工调整"?"manual":""}" data-calendar-date="${d.date}" data-workday="${d.is_workday}" title="${esc(d.source)}"><strong>${Number(d.date.slice(-2))}</strong><small>${d.is_workday?"上班":"休班"}</small></button>`).join("");
   $("#attendance-head").innerHTML = `<tr><th>成员</th>${calendar.days.map(d=>`<th>${Number(d.date.slice(-2))}<small style="display:block">${"一二三四五六日"[d.weekday]}</small></th>`).join("")}</tr>`;
-  $("#attendance-body").innerHTML = members.map(m=>`<tr><td><strong>${esc(m.name)}</strong></td>${calendar.days.map(d=>{if(d.date>todayValue)return `<td><button class="attendance-cell future" disabled aria-label="未来日期">—</button></td>`;const key=`${m.id}:${d.date}`,r=records[key],projects=assignments[key]||[];const cls=r?.status==="加班"?"overtime":r?.status==="调休"?"timeoff":d.is_workday?(projects.length?"assigned":"normal"):"rest";const label=r?(r.status==="加班"?"加":r.status==="调休"?"休":projects.length?"项":"勤"):(d.is_workday?(projects.length?"项":"勤"):"—");const defaultTitle=d.is_workday?(projects.length?`参与项目：${projects.join("、")}`:"默认正常出勤；未参与项目"):"休息日";return `<td><button class="attendance-cell ${cls}" data-member-id="${m.id}" data-att-date="${d.date}" data-status="${r?.status||""}" title="${esc([defaultTitle,r?.note].filter(Boolean).join("；"))}">${label}</button></td>`}).join("")}</tr>`).join("");
+  $("#attendance-body").innerHTML = members.map(m=>`<tr><td><strong>${esc(m.name)}</strong></td>${calendar.days.map(d=>{
+    if(d.date>todayValue)return `<td><button class="attendance-cell future" disabled aria-label="未来日期">—</button></td>`;
+    const key=`${m.id}:${d.date}`,r=records[key],projects=assignments[key]||[];
+    const isWorking = r ? r.status !== "调休" : d.is_workday;
+    const cls=r?.status==="加班"?"overtime":r?.status==="调休"?"timeoff":isWorking?(projects.length?"assigned":"normal"):"rest";
+    const label=r?.status==="加班"?"加":r?.status==="调休"?"休":isWorking?(projects.length?"项":"勤"):"—";
+    const title=isWorking?(projects.length?`参与项目：${projects.join("、")}`:"正常出勤；未参与项目"):"休息";
+    return `<td><button class="attendance-cell ${cls}" data-member-id="${m.id}" data-att-date="${d.date}" data-status="${r?.status||""}" title="${esc(title)}">${label}</button></td>`;
+  }).join("")}</tr>`).join("");
   const periodLabel={week:"周",month:"月",year:"年"}[$("#summary-period").value];
   $("#summary-title").textContent=`${periodLabel}度汇总`;
   $("#summary-range").textContent=`${state.summary.start} 至 ${state.summary.end} · 正常、加班、调休天数及异常明细`;
   $("#attendance-summary").innerHTML = `<div class="summary-row header"><span>成员</span><span>正常</span><span>加班</span><span>调休</span></div>` + state.summary.summary.map(r=>`<div class="summary-row"><strong>${esc(r.name)}</strong><span>${Number(r.normal_days||0)}</span><span>${Number(r.overtime_days||0)}</span><span>${Number(r.time_off_days||0)}</span></div>`).join("");
-  $("#attendance-details").innerHTML = `<h3 style="margin-top:0">加班 / 调休明细</h3>` + (state.summary.details.map(r=>`<div class="detail-line"><time>${esc(r.work_date.slice(5))}</time><strong>${esc(r.name)}</strong><span class="${r.status==="加班"?"status status-维护":"status status-暂停"}">${esc(r.status)} ${Number(r.hours||0)}h</span><span>${esc(r.note||"")}</span></div>`).join("") || `<p style="color:var(--muted)">当前周期暂无异常记录</p>`);
+  $("#attendance-details").innerHTML = `<h3 style="margin-top:0">加班 / 调休明细</h3>` + (state.summary.details.map(r=>`<div class="detail-line"><time>${esc(r.work_date.slice(5))}</time><strong>${esc(r.name)}</strong><span class="${r.status==="加班"?"status status-维护":"status status-暂停"}">${esc(r.status)} ${Number(r.hours||0)}h</span></div>`).join("") || `<p style="color:var(--muted)">当前周期暂无异常记录</p>`);
 }
 
 let modalReturnFocus = null;
@@ -265,6 +326,9 @@ function openModal({title,description="",fields,onSubmit}) {
   if($("#modal").classList.contains("hidden")) modalReturnFocus=document.activeElement;
   $("#modal-title").textContent=title; $("#modal-description").textContent=description; $("#modal-fields").innerHTML=fields;
   $(".modal-actions").classList.remove("hidden");
+  $("#modal-form").onchange=null;
+  $("#modal-form button[type=submit]").disabled=false;
+  delete $("#modal-form button[type=submit]").dataset.needsReview;
   $("#modal-form button[type=submit]").textContent="保存";
   $("#modal").classList.remove("hidden"); $("#modal-backdrop").classList.remove("hidden");
   requestAnimationFrame(()=>($("#modal-fields input:not([disabled]), #modal-fields select:not([disabled]), #modal-fields textarea:not([disabled])") || $("#modal [data-close-modal]"))?.focus({preventScroll:true}));
@@ -275,7 +339,7 @@ function openModal({title,description="",fields,onSubmit}) {
     button.disabled = true;
     try { await onSubmit(new FormData(form),form); }
     catch (_) { /* withLoading 已向用户显示统一错误，避免重复抛送。 */ }
-    finally { button.disabled = false; }
+    finally { button.disabled = button.dataset.needsReview === "true"; }
   };
 }
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal-backdrop").classList.add("hidden"); if(modalReturnFocus?.isConnected)modalReturnFocus.focus({preventScroll:true}); }
@@ -298,10 +362,11 @@ function field(label,name,value="",type="text",full=false,required=false) { retu
 function textarea(label,name,value="",full=true,className="") { return `<label class="field ${full?"full":""}"><span>${esc(label)}</span><textarea${className?` class="${esc(className)}"`:""} name="${name}">${esc(value??"")}</textarea></label>`; }
 function selectField(label,name,options,value="",full=false) { return `<label class="field ${full?"full":""}"><span>${esc(label)}</span><select name="${name}">${options.map(o=>`<option ${o===value?"selected":""}>${esc(o)}</option>`).join("")}</select></label>`; }
 async function withGenerating(form, operation) {
-  const button=$("button[type=submit]",form), label=button.textContent;
-  button.disabled=true; button.textContent="生成中…";
+  const button=$("button[type=submit]",form), label=button.textContent, marker=$("#modal-fields").firstElementChild;
+  const controls=$$("input,select,textarea,button",form).map(el=>[el,el.disabled]);
+  controls.forEach(([el])=>el.disabled=true);button.textContent="生成中…";
   try { return await operation(); }
-  finally { button.disabled=false; button.textContent=label; }
+  finally { if($("#modal-fields").firstElementChild===marker){controls.forEach(([el,disabled])=>el.disabled=disabled);button.textContent=label;} }
 }
 
 function memberModal(member = {}) {
@@ -372,12 +437,13 @@ async function openDayLogs(projectId, workDate) {
 }
 
 async function openProject(id) {
+  setMobileNavigation(false);
   const version = ++navigationVersion;
-  const [detail, todoData] = await withLoading(()=>Promise.all([api.get("projects/detail",{id}),api.get("todos")]));
+  const detail = await withLoading(()=>api.get("projects/detail",{id}));
   if (version !== navigationVersion) return;
   const changingProject = state.view !== "project-detail" || state.selectedProject?.id !== detail.id;
   if (changingProject) { window.scrollTo(0, 0); state.projectLogRange = {start:"",end:""}; state.detailTab="overview"; state.taskFilter="all"; state.taskKeyword=""; state.expandedTasks=new Set(); }
-  state.selectedProject=detail; state.todos=todoData.todos; state.todoPushConfigured=todoData.push_configured;
+  state.selectedProject=detail;
   closeDrawer();
   state.view = "project-detail";
   $$(".view").forEach(el => el.classList.toggle("hidden", el.id !== "view-project-detail"));
@@ -395,7 +461,7 @@ function renderProjectDetail() {
   const detail = state.selectedProject;
   $("#page-subtitle").textContent = detail.description || "任务、记录与项目全生命周期";
   $("#project-detail-content").innerHTML = `
-    <div class="detail-command"><button class="text-action" data-go="projects">项目列表 /</button><span class="${statusClass(detail.status)}">${esc(detail.status)}</span><span class="command-spacer"></span><button class="secondary" data-edit-project="${detail.id}">编辑项目</button></div>
+    <div class="detail-command"><button class="text-action" data-go="projects">项目列表 /</button><span class="${statusClass(detail.status)}">${esc(detail.status)}</span><span class="command-spacer"></span><button class="secondary" data-project-todos="${detail.id}">项目待办</button><button class="secondary" data-edit-project="${detail.id}">编辑项目</button></div>
     <section class="project-summary-band">${progressMeter(detail,true)}<div class="summary-fact"><small>开始日期</small><strong>${esc(detail.start_date||"未设置")}</strong></div><div class="summary-fact"><small>工作记录</small><strong>${detail.work_logs.length}</strong></div><div class="summary-fact"><small>项目成员</small><strong>${esc(detail.membership_history.filter(m=>!m.left_at).map(m=>m.name).join("、")||"暂无成员")}</strong></div></section>
     <nav class="detail-tabs" aria-label="项目详情视图">${[["overview","总览与任务"],["logs","工作记录"],["archive","项目档案"]].map(([id,label])=>`<button data-detail-tab="${id}" class="${state.detailTab===id?"active":""}" aria-pressed="${state.detailTab===id}">${label}</button>`).join("")}</nav>
     <div id="detail-tab-content"></div>`;
@@ -412,7 +478,7 @@ function renderDetailTab() {
   target.innerHTML=`<section class="surface"><div class="section-head"><h2>项目档案</h2></div><dl class="project-info-grid"><div><dt>项目 ID</dt><dd>#${detail.id}</dd></div><div><dt>计划周期</dt><dd>${esc(detail.start_date||"未设置")} — ${esc(detail.end_date||"未设置")}</dd></div><div><dt>创建时间</dt><dd>${fmt(detail.created_at)}</dd></div><div><dt>最近更新</dt><dd>${fmt(detail.updated_at)}</dd></div><div class="project-description"><dt>项目描述</dt><dd>${esc(detail.description||"暂无描述")}</dd></div></dl></section><div class="archive-columns">
     <section class="surface"><div class="section-head"><h2>状态变更</h2><button class="secondary" data-add-status-history>新增状态记录</button></div><div class="archive-content">${detail.status_history.map(h=>`<div class="history-item"><div><strong>${esc(h.from_status?`${h.from_status} → ${h.to_status}`:`创建为 ${h.to_status}`)}</strong><small>${fmt(h.changed_at)} · ${esc(h.note)}</small></div><div class="actions"><button class="text-action" data-edit-status-history="${h.id}">编辑</button><button class="text-action danger" data-delete-status-history="${h.id}">删除</button></div></div>`).join("")}</div></section>
     <section class="surface"><div class="section-head"><h2>成员变更</h2><button class="secondary" data-add-membership-history>新增成员记录</button></div><div class="archive-content">${detail.membership_history.map(h=>`<div class="history-item"><div><strong>${esc(h.name)} · ${h.left_at?"已退出":"参与中"}</strong><small>${esc(h.joined_at)} 加入${h.left_at?`，${esc(h.left_at)} 退出`:""}</small><small>${esc(h.join_reason||"—")} · ${esc(h.leave_reason||"—")}</small></div><div class="actions"><button class="text-action" data-edit-membership-history="${h.id}">编辑</button><button class="text-action danger" data-delete-membership-history="${h.id}">删除</button></div></div>`).join("")||`<div class="empty">暂无成员记录</div>`}</div></section></div>
-    <section class="surface"><div class="section-head"><h2>关联待办</h2><button class="secondary" data-add-project-todo>新增待办</button></div><div class="archive-content">${state.todos.filter(t=>t.project_id===detail.id).map(t=>`<article class="log-card"><p>${esc(t.content)}</p><small>${esc(todoPushLabel(t))} · ${esc(todoScheduleLabel(t))}</small><div class="actions"><button class="text-action" data-edit-todo="${t.id}">编辑</button><button class="text-action danger" data-delete-todo="${t.id}">删除</button></div></article>`).join("")||`<div class="empty">暂无关联待办</div>`}</div></section>`;
+    `;
 }
 
 function recentProjectLogRange() {
@@ -464,27 +530,55 @@ async function membershipHistoryModal(history={}) {
 }
 
 async function generateSummaryModal(summaryDate) {
-  const datedProjects=await withLoading(()=>api.get("projects",{summary_date:summaryDate}));
+  const [datedProjects,templates]=await withLoading(()=>Promise.all([api.get("projects",{summary_date:summaryDate}),api.get("ai/templates")]));
   const savedSummary=summaryByDate(summaryDate);
-  const selectableProjects=datedProjects.filter(project=>project.status!=="结束"||project.has_records||project.has_task_changes);
-  const selected = new Set(selectableProjects.filter(project=>project.has_records||project.has_task_changes).map(project=>project.id));
-  const checks = `<div class="field full"><label>选择项目（默认勾选当天有记录或任务变更的项目）</label><div class="checkbox-grid">${selectableProjects.map(project=>`<label class="check-item"><input type="checkbox" name="project_ids" value="${project.id}" ${selected.has(project.id)?"checked":""} /><span>${esc(project.name)} · ${esc(project.status)}</span></label>`).join("")||`<span class="muted-note">没有可选项目</span>`}</div></div>`;
-  const overwrite = savedSummary ? `<label class="check-item field full overwrite-option"><input type="checkbox" name="overwrite" /><span>覆盖该日已保存的总结；不勾选时仅生成预览</span></label>` : "";
-  openModal({title:savedSummary?"重新生成每日总结":"生成每日总结",description:"按任务归纳当天工作，包含项目级记录、当日任务变更与截至当日的进度。默认勾选当天有记录或任务变更的项目，可手动调整。",fields:`<div class="field"><span>总结日期</span><strong class="readonly-value">${esc(summaryDate)}</strong></div>`+field("附带前几天总结","history_days",1,"number",false,true)+checks+overwrite+`<div id="team-summary-result" class="field full"></div>`,onSubmit:async (form,formElement)=>{
-    const projectIds=form.getAll("project_ids").map(Number);
-    if (!projectIds.length) { toast("请至少选择一个项目",true); return; }
-    const historyDays=Number(form.get("history_days"));
-    if (!Number.isInteger(historyDays)||historyDays<0||historyDays>30) { toast("附带天数必须是 0 到 30 的整数",true); return; }
-    const result=await withGenerating(formElement,()=>withLoading(()=>api.post("ai/summary",{date:summaryDate,project_ids:projectIds,history_days:historyDays,overwrite:form.has("overwrite")})));
-    if (result.persisted) {
-      await loadSummaries(); closeModal(); toast(`${summaryDate} 每日总结已保存`); return;
-    }
+  const selected=new Set(datedProjects.filter(p=>p.has_records||p.has_task_changes).map(p=>p.id));
+  const checks=`<div class="field full"><label>选择项目</label><div class="checkbox-grid">${datedProjects.map(p=>`<label class="check-item"><input type="checkbox" name="project_ids" value="${p.id}" ${selected.has(p.id)?"checked":""}/><span>${esc(p.name)}</span></label>`).join("")||"暂无项目"}</div></div>`;
+  let reviewed=null, reviewing=false;
+  const options=`<label class="field"><span>汇报范围</span><select name="period"><option value="daily">当天日报</option><option value="weekly">截至该日的七天周报（预览 / 复制）</option></select></label><label class="field"><span>本次写作模板</span><select name="template"><option value="custom">已保存的自定义提示词</option>${Object.entries(templates).map(([id,t])=>`<option value="${id}">${esc(t.name)}</option>`).join("")}</select></label>`;
+  openModal({title:"生成工作汇报",description:"先核对模型、写作要求和工作资料，再生成。周报不会覆盖每日总结。",fields:`<div class="field full"><span>汇报截止日期</span><strong>${esc(summaryDate)}</strong></div>`+options+field("附带前几天日报（仅作背景）","history_days",1,"number",false,true)+checks+(savedSummary?`<label class="check-item field full"><input type="checkbox" name="overwrite"/><span>覆盖该日已保存的日报；不勾选时仅生成预览</span></label>`:"")+`<div class="field full"><button type="button" class="secondary" id="review-summary">核对生成资料</button></div><div id="summary-input-preview" class="field full"></div><div id="team-summary-result" class="field full"></div>`,onSubmit:async(form,formElement)=>{
+    if(!reviewed){toast("请先核对生成资料",true);return;}
+    const data=readInputs();
+    if(JSON.stringify(data)!==reviewed.inputs){invalidate();toast("选项已变化，请重新核对资料",true);return;}
+    let result;
+    try {result=await withGenerating(formElement,()=>withLoading(()=>api.post("ai/summary",{...data,fingerprint:reviewed.fingerprint,overwrite:form.has("overwrite")})));}
+    catch(error){invalidate();throw error;}
+    if($("#review-summary")!==review)return;
+    if(result.persisted){await loadSummaries();closeModal();toast(`${summaryDate} 日报已保存`);return;}
     state.summaryPreview=result;
-    $("#team-summary-result").innerHTML=`<label>新生成的预览（尚未覆盖）</label><div class="ai-box summary-result">${esc(result.content)}</div><button type="button" class="primary preview-save" data-save-summary-preview>使用此结果覆盖已保存总结</button>`;
-    toast("已生成预览，原总结未被覆盖");
+    $("#team-summary-result").innerHTML=`<label>${result.period==="weekly"?"周报预览（未保存，不覆盖日报）":"日报预览（尚未覆盖原总结）"}</label><textarea readonly class="summary-content-editor" aria-label="生成结果">${esc(result.content)}</textarea><button type="button" class="secondary" id="copy-summary-result">复制汇报</button>${result.period==="daily"?'<button type="button" class="primary preview-save" data-save-summary-preview>使用此结果覆盖已保存总结</button>':""}`;
+    $("#copy-summary-result").addEventListener("click",()=>copyText(result.content).then(()=>toast("汇报已复制")).catch(e=>toast(e.message,true)));
+    toast("已生成预览，尚未保存");
   }});
-  const historyInput=$("#modal-form [name=history_days]"); historyInput.min="0"; historyInput.max="30"; historyInput.step="1";
-  $("#modal-form button[type=submit]").textContent=savedSummary?"重新生成":"生成并保存";
+  const form=$("#modal-form"),submit=$("button[type=submit]",form),review=$("#review-summary");
+  submit.disabled=true;submit.dataset.needsReview="true";submit.textContent="确认资料并生成";
+  const history=form.elements.history_days;history.min="0";history.max="30";history.step="1";
+  function readInputs(){return {date:summaryDate,project_ids:new FormData(form).getAll("project_ids").map(Number),history_days:form.elements.period.value==="weekly"?0:Number(history.value),period:form.elements.period.value,template:form.elements.template.value};}
+  function invalidate(){reviewed=null;submit.disabled=true;submit.dataset.needsReview="true";state.summaryPreview=null;$("#summary-input-preview").textContent="请核对最新生成资料。";$("#team-summary-result").replaceChildren();}
+  form.onchange=event=>{
+    if(event.target.name==="overwrite")return;
+    if(event.target.name==="template" && event.target.value==="weekly")form.elements.period.value="weekly";
+    if(event.target.name==="period" || (event.target.name==="template" && event.target.value==="weekly")){
+      const weekly=form.elements.period.value==="weekly";history.disabled=weekly;history.closest(".field").classList.toggle("hidden",weekly);
+      if(weekly){form.elements.template.value="weekly";$$('[name="project_ids"]',form).forEach(i=>i.checked=true);}
+      else if(form.elements.template.value==="weekly")form.elements.template.value="custom";
+      if(form.elements.overwrite){form.elements.overwrite.disabled=weekly;form.elements.overwrite.checked=false;form.elements.overwrite.closest("label").classList.toggle("hidden",weekly);}
+    }
+    invalidate();
+  };
+  history.addEventListener("input",invalidate);
+  review.addEventListener("click",async()=>{
+    if(reviewing || !form.reportValidity())return;
+    const data=readInputs();if(!data.project_ids.length){toast("请至少选择一个项目",true);return;}
+    reviewing=true;review.disabled=true;submit.disabled=true;
+    try{
+      const result=await withLoading(()=>api.post("ai/preview",data));
+      if($("#review-summary")!==review || JSON.stringify(readInputs())!==JSON.stringify(data))return;
+      reviewed={fingerprint:result.fingerprint,inputs:JSON.stringify(data)};
+      $("#summary-input-preview").innerHTML=`<p><strong>已核对 · ${esc(result.model)}</strong><br>${esc(result.start)} 至 ${esc(result.date)} · ${result.project_ids.length} 个项目 · 历史背景 ${result.history_days} 天</p><details open><summary>本次写作要求</summary><pre class="diagnostic-json">${esc(result.writing_prompt||"未填写自定义要求")}</pre></details><details><summary>固定事实约束</summary><p>${esc(result.rules)}</p></details><details><summary>查看完整工作资料</summary><pre class="diagnostic-json">${esc(result.material)}</pre></details><details><summary>模型地址与实际请求参数</summary><pre class="diagnostic-json">${esc(result.endpoint)}\n${esc(JSON.stringify(result.request,null,2))}</pre></details>`;
+      submit.disabled=false;submit.dataset.needsReview="false";
+    }catch(_){reviewed=null;}finally{reviewing=false;review.disabled=false;}
+  });
 }
 
 function openSummaryDetail(summaryDate) {
@@ -501,12 +595,13 @@ function openSummaryDetail(summaryDate) {
 
 function attendanceModal(memberId="",dateValue=iso(today),status="加班") {
   const memberOptions=state.members.map(m=>`<option value="${m.id}" ${Number(memberId)===Number(m.id)?"selected":""}>${esc(m.name)}</option>`).join("");
-  openModal({title:"登记考勤",description:"正常、加班、调休默认均为 8 小时。",fields:`<label class="field"><span>成员</span><select name="member_id" required>${memberOptions}</select></label>`+field("日期","date",dateValue,"date",false,true)+selectField("类型","status",["正常","加班","调休"],status)+field("时长（小时）","hours",8,"number")+textarea("说明","note",""),onSubmit:async form=>{
-    await withLoading(()=>api.post("attendance/save",{member_id:Number(form.get("member_id")),date:form.get("date"),status:form.get("status"),hours:Number(form.get("hours")),note:form.get("note")}));closeModal();toast("考勤已保存");await loadAttendance();
+  openModal({title:"登记考勤",description:"正常、加班、调休默认均为 8 小时。",fields:`<label class="field"><span>成员</span><select name="member_id" required>${memberOptions}</select></label>`+field("日期","date",dateValue,"date",false,true)+selectField("类型","status",["正常","加班","调休"],status)+field("时长（小时）","hours",8,"number"),onSubmit:async form=>{
+    await withLoading(()=>api.post("attendance/save",{member_id:Number(form.get("member_id")),date:form.get("date"),status:form.get("status"),hours:Number(form.get("hours"))}));closeModal();toast("考勤已保存");await loadAttendance();
   }});
 }
 
 document.addEventListener("click", async event => {
+  const projectTodos=event.target.closest("[data-project-todos]");if(projectTodos){await switchView("todos");await withLoading(()=>todoUI.load(Number(projectTodos.dataset.projectTodos)));return;}
   const tab=event.target.closest("[data-detail-tab]"); if(tab){state.detailTab=tab.dataset.detailTab;renderDetailTab();return;}
   if(event.target.closest("[data-add-task]")){taskModal();return;}
   const taskControl=event.target.closest("[data-edit-task],[data-toggle-task],[data-delete-task],[data-add-task-log]");
@@ -533,19 +628,6 @@ document.addEventListener("click", async event => {
     $("#project-log-end").value = state.projectLogRange.end;
     renderProjectLogs(); return;
   }
-  const editTodo = event.target.closest("[data-edit-todo]");
-  const deleteTodo = event.target.closest("[data-delete-todo]");
-  if (editTodo || deleteTodo) {
-    try {
-      if (editTodo) await todoModal(state.todos.find(todo=>todo.id===Number(editTodo.dataset.editTodo)));
-      else if (await confirmAction("确认删除这条待办？未发送的提醒将停止。")) {
-        await withLoading(()=>api.post("todos/delete",{id:Number(deleteTodo.dataset.deleteTodo)}));
-        toast("待办已删除"); await withLoading(loadTodos); if(state.view==="project-detail")await openProject(state.selectedProject.id);
-      }
-    } catch (_) { /* withLoading already displays the error. */ }
-    return;
-  }
-  if(event.target.closest("[data-add-project-todo]")){await todoModal({project_id:state.selectedProject.id});return;}
   if(event.target.closest("[data-add-project-log]")){workLogModal(state.selectedProject.id);return;}
   const editLog=event.target.closest("[data-edit-project-log]");
   if(editLog){const log=state.selectedProject.work_logs.find(item=>item.id==editLog.dataset.editProjectLog);workLogModal(state.selectedProject.id,log.work_date,log);return;}
@@ -601,8 +683,6 @@ document.addEventListener("input",filterTaskSearch);
 document.addEventListener("compositionend",filterTaskSearch);
 
 $("#member-search").addEventListener("input",renderMembers);
-$("#todo-search").addEventListener("input",renderTodos);
-$("#todo-project-filter").addEventListener("change",renderTodos);
 $("#project-search").addEventListener("input",renderProjects);
 $("#project-status-filter").addEventListener("change",renderProjects);
 $("#record-status-filter").addEventListener("change",renderTimeline);
@@ -615,14 +695,14 @@ $("#refresh").addEventListener("click",()=>loadView(state.view));
 $("#month-prev").addEventListener("click",()=>moveMonth(-1));
 $("#month-next").addEventListener("click",()=>moveMonth(1));
 function moveMonth(delta){const [y,m]=$("#attendance-month").value.split("-").map(Number),d=new Date(y,m-1+delta,1);$("#attendance-month").value=monthIso(d);withLoading(loadAttendance)}
-$("#primary-action").addEventListener("click",async()=>{if(state.view==="project-records"){await generateSummaryModal($("#timeline-end").value);return;}if(state.view==="project-detail"){if(state.selectedProject)workLogModal(state.selectedProject.id);return;}if(state.view==="todos"){try {await todoModal();}catch(_){} return;}if(state.view==="members")memberModal();else if(state.view==="attendance")attendanceModal();else{if(!state.members.length)state.members=await api.get("members");await projectModal();}});
+$("#primary-action").addEventListener("click",async()=>{if(state.view==="models"||state.view==="settings"){await saveSettings().catch(()=>{});return;}if(state.view==="todos"){await withLoading(()=>todoUI.open()).catch(()=>{});return;}if(state.view==="project-records"){await generateSummaryModal($("#timeline-end").value);return;}if(state.view==="project-detail"){if(state.selectedProject)workLogModal(state.selectedProject.id);return;}if(state.view==="members")memberModal();else if(state.view==="attendance")attendanceModal();else{if(!state.members.length)state.members=await api.get("members");await projectModal();}});
 $("#modal-backdrop").addEventListener("click",closeModal);
 $("#confirm-cancel").addEventListener("click",()=>resolveConfirmation(false));
 $("#confirm-submit").addEventListener("click",()=>resolveConfirmation(true));
 $("#confirm-backdrop").addEventListener("click",()=>resolveConfirmation(false));
 document.addEventListener("keydown",event=>{
-  const modal=confirmResolver?$("#confirm-modal"):!$("#modal").classList.contains("hidden")?$("#modal"):null;
-  if(event.key==="Escape"){if(confirmResolver)resolveConfirmation(false);else if(modal)closeModal();else closeDrawer();}
+  const modal=confirmResolver?$("#confirm-modal"):!$("#modal").classList.contains("hidden")?$("#modal"):document.body.classList.contains("navigation-open")?$("#app-navigation"):null;
+  if(event.key==="Escape"){if(confirmResolver)resolveConfirmation(false);else if(document.body.classList.contains("navigation-open"))setMobileNavigation(false);else if(modal)closeModal();else closeDrawer();}
   if(event.key==="Tab"&&modal){
     const controls=$$('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]',modal).filter(el=>el.getClientRects().length);
     const first=controls[0],last=controls.at(-1);
@@ -636,90 +716,3 @@ await withLoading(loadProjects);
 const initialProject = Number(new URLSearchParams(location.search).get("project"));
 if (initialView === "project-detail" && state.projects.some(p => p.id === initialProject)) await openProject(initialProject);
 else await switchView(viewMeta[initialView] ? initialView : "projects");
-setInterval(() => {
-  if (state.view === "todos" && !document.hidden && $("#modal").classList.contains("hidden") && !confirmResolver && !loadingCount) {
-    loadTodos().catch(() => { $("#todo-push-notice").textContent = "待办状态刷新失败，请点击右上角刷新重试。"; });
-  }
-}, 15000);
-
-function createDemoApi(){
-  const now=new Date().toISOString(), dates=[-4,-3,-2,-1,0].map(n=>{const d=new Date();d.setDate(d.getDate()+n);return iso(d)});
-  const store={members:[{id:1,name:"张三",role:"产品经理",notes:"",ready_projects:1,active_projects:1,maintenance_projects:0,paused_projects:0,completed_projects:1},{id:2,name:"陈小明",role:"前端工程师",notes:"",ready_projects:0,active_projects:1,maintenance_projects:1,paused_projects:0,completed_projects:1},{id:3,name:"刘芳",role:"后端工程师",notes:"",ready_projects:0,active_projects:1,maintenance_projects:1,paused_projects:0,completed_projects:0}],projects:[],logs:[],summaries:{},todos:[]};
-  store.projects=[{id:1,name:"客户管理系统",description:"建设统一客户信息与合同管理平台",status:"进行",start_date:dates[0],end_date:null,created_at:now,updated_at:now,latest_record_date:dates[4],members:store.members},{id:2,name:"移动端 App",description:"员工移动办公应用",status:"维护",start_date:dates[0],end_date:null,created_at:now,updated_at:now,latest_record_date:dates[4],members:store.members.slice(1)},{id:3,name:"官网重构",description:"品牌官网视觉与内容升级",status:"结束",start_date:dates[0],end_date:dates[4],created_at:now,updated_at:now,latest_record_date:dates[4],members:store.members.slice(0,2)},{id:4,name:"数据分析平台",description:"经营数据指标与看板",status:"准备",start_date:null,end_date:null,created_at:now,updated_at:now,latest_record_date:null,members:[store.members[0]]}];
-  store.projects.push({id:5,name:"内部工具升级",description:"等待资源后继续推进",status:"暂停",start_date:dates[0],end_date:null,created_at:now,updated_at:now,latest_record_date:null,members:[store.members[0]]});
-  store.logs=[{id:1,project_id:1,work_date:dates[4],content:"完成需求评审，开始数据库设计"},{id:2,project_id:1,work_date:dates[4],content:"整理客户字段与权限矩阵"},{id:3,project_id:2,work_date:dates[4],content:"修复登录模块问题"},{id:4,project_id:3,work_date:dates[4],content:"完成上线验收"}];
-  store.members.forEach(member => { member.projects = store.projects.filter(project => project.members.some(item => item.id === member.id)).map(project=>({...project,joined_at:dates[0],left_at:null})); });
-  store.tasks = store.projects.slice(0,3).flatMap((p,i)=>[0,1,2].map((n)=>({id:i*3+n+1,project_id:p.id,name:["需求梳理","核心功能开发","联调与验收"][n],description:["确认范围与验收标准","交付核心流程","验证端到端工作流"][n],status:n<2?"完成":"未完成",start_date:dates[Math.min(n,2)],completed_date:n<2?dates[n+1]:null,created_at:now,updated_at:now,deleted_at:null,history:[]})));
-  store.logs.forEach((log,i)=>{log.task_id=log.project_id===1?3:log.project_id===2?6:9;});
-  const taskData=projectId=>store.tasks.filter(t=>t.project_id==projectId).map(t=>({...t,duration_days:Math.max(0,Math.round((Date.parse(t.completed_date||t.deleted_at?.slice(0,10)||iso(new Date()))-Date.parse(t.start_date))/86400000)+1)}));
-  const progressData=p=>{const ts=taskData(p.id).filter(t=>!t.deleted_at),done=ts.filter(t=>t.status==="完成").length;return {...p,task_count:ts.length,completed_task_count:done,progress:ts.length?Math.round(done/ts.length*100):0};};
-  const decoratedLog=log=>{const t=store.tasks.find(t=>t.id===log.task_id);return {...log,task_name:t?.name,task_deleted_at:t?.deleted_at};};
-  const auditTask=(task,event)=>task.history.push({id:Date.now(),event,changed_at:new Date().toISOString(),snapshot:{name:task.name,status:task.status,start_date:task.start_date,completed_date:task.completed_date}});
-  store.tasks.forEach(t=>auditTask(t,"创建"));
-  const calendar=month=>{const end=Number(lastDay(month).slice(-2));return {month,workdays:0,days:Array.from({length:end},(_,i)=>{const date=`${month}-${String(i+1).padStart(2,"0")}`,weekday=new Date(date+"T00:00:00").getDay();const is_workday=weekday!==0&&weekday!==6;return {date,weekday:(weekday+6)%7,is_workday,source:"法定日历"}})}};
-  const rangeDates=(start,end)=>{const result=[];for(let day=new Date(start+"T00:00:00");day<=new Date(end+"T00:00:00");day.setDate(day.getDate()+1))result.push(iso(day));return result};
-  const todayValue=iso(today);
-  const refreshLatestRecord=projectId=>{const project=store.projects.find(item=>item.id==projectId);if(project)project.latest_record_date=store.logs.filter(log=>log.project_id==projectId).reduce((latest,log)=>!latest||log.work_date>latest?log.work_date:latest,null)};
-  const attendanceSummary=(start,end)=>{const boundedEnd=end>todayValue?todayValue:end,workdays=rangeDates(start,boundedEnd).filter(day=>{const weekday=new Date(day+"T00:00:00").getDay();return weekday!==0&&weekday!==6});return store.members.map(member=>({id:member.id,name:member.name,normal_days:workdays.length,overtime_days:0,time_off_days:0}))};
-  store.todos = [{id:1,project_id:1,project_name:store.projects[0].name,content:"整理客户字段与权限清单，安排接口联调",push_mode:"once",push_enabled:0,push_at:null,created_at:now,updated_at:now,sent_at:null,push_error:""}];
-  return {
-    async get(endpoint,params={}){
-      await new Promise(resolve=>setTimeout(resolve,80));
-      if(endpoint==="tasks")return taskData(params.project_id);
-      if(endpoint==="todos")return {todos:store.todos,push_configured:false};
-      if(endpoint==="members")return store.members;
-      if(endpoint==="projects")return params.summary_date?store.projects.map(project=>({...project,has_records:store.logs.some(log=>log.project_id===project.id&&log.work_date===params.summary_date),has_task_changes:store.tasks.some(task=>task.project_id===project.id&&task.history.some(h=>h.changed_at.slice(0,10)===params.summary_date))})):store.projects.map(progressData);
-      if(endpoint==="summaries"){const range=rangeDates(params.start,params.end);return {dates:range,summaries:Object.values(store.summaries).filter(item=>range.includes(item.summary_date))}}
-      if(endpoint==="timeline"){const range=rangeDates(params.start,params.end),logs={};store.logs.filter(log=>range.includes(log.work_date)).forEach(log=>(logs[`${log.project_id}:${log.work_date}`]??=[]).push(log));return {dates:range,projects:store.projects,logs}}
-      if(endpoint==="worklogs"){const project=store.projects.find(item=>item.id==params.project_id);return {project,date:params.date,logs:store.logs.filter(log=>log.project_id==params.project_id&&log.work_date===params.date).map(decoratedLog)}}
-      if(endpoint==="projects/detail"){const project=store.projects.find(item=>item.id==params.id);return {...progressData(project),tasks:taskData(project.id),work_logs:store.logs.filter(log=>log.project_id==params.id).map(decoratedLog).sort((a,b)=>b.work_date.localeCompare(a.work_date)||b.id-a.id),status_history:[{id:1,from_status:"准备",to_status:project.status,changed_at:now,note:"进入当前阶段"},{id:2,from_status:null,to_status:"准备",changed_at:dates[0],note:"项目创建"}],membership_history:project.members.map((member,index)=>({id:index+1,name:member.name,joined_at:dates[0],left_at:null,join_reason:"项目创建",leave_reason:""}))}}
-      if(endpoint==="attendance"){const result=calendar(params.month);result.workdays=result.days.filter(day=>day.is_workday).length;const assignments={};result.days.filter(day=>day.date<=todayValue).forEach(day=>store.projects.filter(project=>(project.status==="进行"||(project.status==="维护"&&store.logs.some(log=>log.project_id===project.id&&log.work_date===day.date)))).forEach(project=>project.members.forEach(member=>(assignments[`${member.id}:${day.date}`]??=[]).push(project.name))));return {calendar:result,members:store.members,records:{},assignments,today:todayValue}}
-      if(endpoint==="attendance/summary"){const start=params.start||`${monthIso(today)}-01`,requestedEnd=params.end||todayValue,end=requestedEnd>todayValue?todayValue:requestedEnd,summary=attendanceSummary(start,end);return {start,end,summary,details:[]}};
-      return {};
-    },
-    async post(endpoint,body){
-      if(endpoint==="tasks/save"){
-        let task=store.tasks.find(t=>t.id===body.id), before=task?.status;
-        const values={name:"",description:"",status:"未完成",start_date:iso(new Date()),completed_date:null,...task,...body};
-        if(!values.name.trim())throw new Error("任务名称不能为空");
-        if(values.status==="完成"&&(values.completed_date<values.start_date||values.completed_date>iso(new Date())))throw new Error("完成日期不能早于开始日期或晚于今天");
-        if(!task){task={id:Date.now(),created_at:new Date().toISOString(),history:[]};store.tasks.push(task);}
-        Object.assign(task,values,{id:task.id,updated_at:new Date().toISOString()});
-        if(task.status==="未完成")task.completed_date=null;
-        auditTask(task,!before?"创建":before!==task.status?(task.status==="完成"?"完成":"重新打开"):"修改");return task;
-      }
-      if(endpoint==="tasks/delete"){const task=store.tasks.find(t=>t.id===body.id);task.deleted_at=new Date().toISOString();auditTask(task,"删除");return {deleted:true};}
-      if(endpoint==="todos/save"){
-        const project=store.projects.find(item=>item.id===body.project_id);
-        if(!project)throw new Error("请选择项目");
-        const saved={...body,project_name:project.name,updated_at:new Date().toISOString()};
-        if(body.push_mode==="weekly"){
-          const now=Date.now(),local=new Date(now+body.push_utc_offset*60000),[hour,minute]=body.push_time.split(":").map(Number);
-          for(let delta=0;delta<8;delta++){const next=new Date(Date.UTC(local.getUTCFullYear(),local.getUTCMonth(),local.getUTCDate()+delta,hour,minute));const due=next.getTime()-body.push_utc_offset*60000;if(body.push_weekdays.includes((next.getUTCDay()+6)%7)&&due>now){saved.push_due=due/1000;break;}}
-        }else saved.push_due=body.push_at?new Date(body.push_at).getTime()/1000:null;
-        if(body.id)Object.assign(store.todos.find(item=>item.id===body.id),saved);
-        else store.todos.unshift({...saved,id:Date.now(),created_at:saved.updated_at,sent_at:null,push_error:""});
-        return saved;
-      }
-      if(endpoint==="todos/delete"){store.todos=store.todos.filter(item=>item.id!==body.id);return {deleted:true};}
-      await new Promise(resolve=>setTimeout(resolve,endpoint==="ai/summary"?450:120));
-      if(endpoint==="ai/summary"){const content=store.projects.filter(p=>body.project_ids.includes(p.id)).map(p=>{const logs=store.logs.filter(l=>l.project_id===p.id&&l.work_date===body.date);return `${p.name}：${logs.length?logs.map(l=>`${store.tasks.find(t=>t.id===l.task_id)?.name||"项目级记录"}：${l.content}`).join("；"):"当天无工作记录"}。`}).join("\n"),persisted=!store.summaries[body.date]||body.overwrite;if(persisted)store.summaries[body.date]={id:Date.now(),summary_date:body.date,project_ids:body.project_ids,project_names:store.projects.filter(project=>body.project_ids.includes(project.id)).map(project=>project.name),provider_id:"demo",content,created_at:new Date().toISOString()};return {content,date:body.date,project_ids:body.project_ids,persisted}}
-      if(endpoint==="summaries/save"){const saved=store.summaries[body.date];store.summaries[body.date]={...saved,content:body.content,project_ids:body.project_ids||saved.project_ids,created_at:new Date().toISOString()};store.summaries[body.date].project_names=store.projects.filter(project=>store.summaries[body.date].project_ids.includes(project.id)).map(project=>project.name);return store.summaries[body.date]}
-      if(endpoint==="summaries/delete"){delete store.summaries[body.date];return {deleted:true}}
-      if(endpoint==="worklogs/save"){
-        if(!body.content?.trim())throw new Error("工作内容不能为空");
-        const task=store.tasks.find(t=>t.id===body.task_id);
-        if(task&&body.task_action&&body.task_action!=="keep"){
-          if(body.task_action==="complete"&&(body.work_date<task.start_date||body.work_date>iso(new Date())))throw new Error("完成日期不能早于开始日期或晚于今天");
-          const status=body.task_action==="complete"?"完成":"未完成";
-          if(status!==task.status){task.status=status;task.completed_date=status==="完成"?body.work_date:null;auditTask(task,status==="完成"?"完成":"重新打开");}
-        }
-        if(body.id)Object.assign(store.logs.find(l=>l.id===body.id),body,{updated_at:new Date().toISOString()});else store.logs.push({...body,id:Date.now(),created_at:new Date().toISOString()});refreshLatestRecord(body.project_id);return body;
-      }
-      if(endpoint==="worklogs/delete"){const log=store.logs.find(item=>item.id==body.id);store.logs=store.logs.filter(item=>item.id!=body.id);if(log)refreshLatestRecord(log.project_id);return {deleted:true}}
-      if(endpoint==="members/save"){if(body.id)Object.assign(store.members.find(member=>member.id===body.id),body);else store.members.push({...body,id:Date.now(),ready_projects:0,active_projects:0,maintenance_projects:0,paused_projects:0,completed_projects:0});return body}
-      if(endpoint==="projects/save"){const members=store.members.filter(member=>body.member_ids.includes(member.id));if(body.id)Object.assign(store.projects.find(project=>project.id===body.id),body,{members,updated_at:now});else store.projects.unshift({...body,id:Date.now(),members,created_at:now,updated_at:now,latest_record_date:null});return body}
-      return {saved:true};
-    }
-  };
-}

@@ -56,11 +56,59 @@ class TaskRepository:
             event["snapshot"] = json.loads(event["snapshot"])
             histories.setdefault(event["task_id"], []).append(event)
         today = datetime.now().astimezone().date()
+        status_history = self._rows(conn.execute(
+            "SELECT to_status,changed_at FROM project_status_history WHERE project_id=? ORDER BY changed_at,id",
+            (project_id,),
+        ))
+        logged_days = {}
+        for row in conn.execute(
+            "SELECT DISTINCT task_id,work_date FROM work_logs WHERE project_id=? AND task_id IS NOT NULL",
+            (project_id,),
+        ):
+            logged_days.setdefault(row["task_id"], set()).add(row["work_date"])
         for task in tasks:
             end = task["completed_date"] or (task["deleted_at"] or today.isoformat())[:10]
-            task["duration_days"] = max(0, (date.fromisoformat(end) - date.fromisoformat(task["start_date"])).days + 1)
+            task["active_periods"] = self._task_active_periods(
+                task["start_date"], end, status_history, logged_days.get(task["id"], set())
+            )
+            task["duration_days"] = sum(
+                (date.fromisoformat(period["end_date"]) - date.fromisoformat(period["start_date"])).days + 1
+                for period in task["active_periods"]
+            )
             task["history"] = histories.get(task["id"], [])
         return tasks
+
+    def _task_active_periods(self, start, end, status_history, logged_days):
+        """Count by historical project status, with task-specific maintenance logs.
+
+        Like attendance, the last status change on a date governs that date.
+        Other statuses (including dates before recorded history) retain the
+        existing natural-day behavior. Adjacent counted intervals are merged.
+        """
+        if end < start:
+            return []
+        boundaries = sorted({start, *(h["changed_at"][:10] for h in status_history
+                                      if start < h["changed_at"][:10] <= end)})
+        periods = []
+
+        def append_period(first, last):
+            if periods and date.fromisoformat(first).toordinal() == date.fromisoformat(periods[-1]["end_date"]).toordinal() + 1:
+                periods[-1]["end_date"] = last
+            else:
+                periods.append({"start_date": first, "end_date": last})
+
+        for index, first in enumerate(boundaries):
+            last = (date.fromordinal(date.fromisoformat(boundaries[index + 1]).toordinal() - 1).isoformat()
+                    if index + 1 < len(boundaries) else end)
+            status = self._status_on_date(status_history, first)
+            if status == "暂停":
+                continue
+            if status == "维护":
+                for day in sorted(day for day in logged_days if first <= day <= last):
+                    append_period(day, day)
+            else:
+                append_period(first, last)
+        return periods
 
     def list_tasks(self, project_id):
         project_id = parse_id(project_id, "project_id")

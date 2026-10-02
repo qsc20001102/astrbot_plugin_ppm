@@ -129,6 +129,55 @@ class TaskTests(unittest.TestCase):
         with self.assertRaises(NotFoundError):
             self.db.delete_task(task["id"], self.project)
 
+    def test_lifecycle_uses_historical_status_and_task_specific_logs(self):
+        task = self.task(status="完成", completed_date="2026-01-10")
+        other = self.task(name="其他任务")
+        with self.db._connection() as conn:
+            conn.execute("DELETE FROM project_status_history WHERE project_id=?", (self.project,))
+        for day, status in (("01", "进行"), ("03", "维护"), ("06", "暂停"), ("08", "进行")):
+            self.db.insert_status_history({"project_id": self.project, "to_status": status,
+                                           "changed_at": f"2026-01-{day}T09:00:00"})
+        record = self.log(task_id=task["id"], work_date="2026-01-04")
+        duplicate = self.log(task_id=task["id"], work_date="2026-01-04")
+        self.log(task_id=other["id"], work_date="2026-01-03")
+        self.log(work_date="2026-01-05")
+        self.log(task_id=task["id"], work_date="2026-01-06")
+        self.log(task_id=task["id"], work_date="2026-01-11")
+        current = self.db.project_detail(self.project)["tasks"][0]
+        self.assertEqual(current["duration_days"], 6)
+        self.assertEqual(current["active_periods"], [
+            {"start_date": "2026-01-01", "end_date": "2026-01-02"},
+            {"start_date": "2026-01-04", "end_date": "2026-01-04"},
+            {"start_date": "2026-01-08", "end_date": "2026-01-10"},
+        ])
+        self.db.delete_work_log(duplicate["id"])
+        self.log(id=record["id"], task_id=None, work_date="2026-01-04")
+        self.assertEqual(self.db.list_tasks(self.project)[0]["duration_days"], 5)
+
+    def test_lifecycle_same_day_history_corrections_and_empty_periods(self):
+        self.task(status="完成", completed_date="2026-01-02")
+        for status in ("进行", "维护", "暂停"):
+            self.db.insert_status_history({"project_id": self.project, "to_status": status,
+                                           "changed_at": "2026-01-01T09:00:00"})
+        current = self.db.list_tasks(self.project)[0]
+        self.assertEqual(current["duration_days"], 0)
+        self.assertEqual(current["active_periods"], [])
+        history = next(h for h in self.db.project_detail(self.project)["status_history"]
+                       if h["to_status"] == "暂停")
+        self.db.update_status_history({**history, "to_status": "进行"})
+        self.assertEqual(self.db.list_tasks(self.project)[0]["duration_days"], 2)
+
+    def test_open_and_deleted_lifecycle_stop_at_their_end_date(self):
+        today = date.today()
+        start = (today - timedelta(days=2)).isoformat()
+        task = self.task(start_date=start)
+        self.assertEqual(self.db.list_tasks(self.project)[0]["duration_days"], 3)
+        self.db.delete_task(task["id"], self.project)
+        with self.db._connection() as conn:
+            conn.execute("UPDATE project_tasks SET deleted_at=? WHERE id=?", (start + "T12:00:00", task["id"]))
+        self.assertEqual(self.db.list_tasks(self.project)[0]["active_periods"],
+                         [{"start_date": start, "end_date": start}])
+
     def test_daily_reads_include_task_links(self):
         task = self.task()
         self.log(task_id=task["id"])

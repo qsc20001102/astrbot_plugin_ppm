@@ -2,23 +2,26 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PPM 项目进度管理</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>项目进度管理</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
   <link rel="stylesheet" href="./style.css" />
-  <link rel="stylesheet" href="./mobile.css" />
   <link rel="stylesheet" href="./refinements.css" />
   <link rel="stylesheet" href="./workbench.css" />
   <link rel="stylesheet" href="./themes.css" />
+  <link rel="stylesheet" href="./mobile.css" />
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand"><div><strong>PPM</strong><small>项目进度管理</small></div></div>
-      <nav id="nav"><button data-view="projects" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h6l2 2h10v12H3z M3 6V4h7l2 2"/></svg>项目列表</button><button data-view="project-records"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z M14 3v5h5 M9 12h7 M9 16h7"/></svg>项目记录</button><button data-view="project-detail" aria-controls="project-submenu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11 M12 19V4 M19 19V8"/></svg>项目详情</button><div id="project-submenu" class="project-submenu" aria-label="所有项目"></div><button data-view="todos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M8 12l3 3 6-7"/></svg>待办事项</button><button data-view="members"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-3a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v3 M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M18 9a3 3 0 0 0 0-6 M22 21v-3a4 4 0 0 0-3-4"/></svg>团队成员</button><button data-view="attendance"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v16H4z M8 2v6 M16 2v6 M4 10h16"/></svg>考勤管理</button></nav><div class="sidebar-caption">从任务出发<br><strong>让每一步都有迹可循。</strong></div>
+    <aside class="sidebar" id="app-navigation" aria-label="功能导航">
+      <div class="brand"><img src="./favicon.svg" width="40" height="40" alt="" /><strong>项目进度管理</strong><button class="icon-button mobile-only" id="close-navigation" aria-label="关闭导航">×</button></div>
+      <nav id="nav"><button data-view="projects" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h6l2 2h10v12H3z M3 6V4h7l2 2"/></svg>项目列表</button><button data-view="project-records"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z M14 3v5h5 M9 12h7 M9 16h7"/></svg>项目记录</button><button data-view="project-detail" aria-controls="project-submenu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11 M12 19V4 M19 19V8"/></svg>项目详情</button><div id="project-submenu" class="project-submenu" aria-label="所有项目"></div><button data-view="members"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-3a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v3 M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M18 9a3 3 0 0 0 0-6 M22 21v-3a4 4 0 0 0-3-4"/></svg>团队成员</button><button data-view="attendance"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v16H4z M8 2v6 M16 2v6 M4 10h16"/></svg>考勤管理</button><button data-view="todos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M8 12l3 3 6-7"/></svg>待办记录</button><button data-view="models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z M9 1v4 M15 1v4 M9 19v4 M15 19v4"/></svg>模型配置</button><button data-view="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16 M4 17h16 M9 4v6 M15 14v6"/></svg>系统配置</button></nav><div class="sidebar-caption">从任务出发<br><strong>让每一步都有迹可循。</strong></div>
     </aside>
 
+    <button id="navigation-backdrop" class="navigation-backdrop" aria-label="关闭导航" tabindex="-1" hidden></button>
     <main>
       <header class="topbar">
+        <button class="icon-button mobile-only" id="menu-toggle" aria-label="打开功能导航" aria-controls="app-navigation" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16"/></svg></button>
         <div><h1 id="page-title">项目列表</h1><p id="page-subtitle">项目状态、参与成员与项目档案</p></div>
         <div class="top-actions"><span id="today-label"></span><button class="icon-button" id="refresh" title="刷新" aria-label="刷新"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5 M20 12a8 8 0 1 0-2 6 M20 12l-4-5"/></svg></button><button class="primary" id="primary-action">新建项目</button></div>
       </header>
@@ -31,10 +34,10 @@
       </section>
 
       <section id="view-attendance" class="view hidden">
-        <div class="toolbar"><div class="toolbar-group"><button class="icon-button" id="month-prev">‹</button><input type="month" id="attendance-month" /><button class="icon-button" id="month-next">›</button></div><div class="legend"><span><i class="dot normal"></i>正常</span><span><i class="dot overtime"></i>加班</span><span><i class="dot timeoff"></i>调休</span><span><i class="dot rest"></i>休息日</span></div></div>
+        <div class="toolbar"><div class="toolbar-group"><button class="icon-button" id="month-prev" aria-label="上个月">‹</button><input type="month" id="attendance-month" /><button class="icon-button" id="month-next" aria-label="下个月">›</button></div><div class="legend"><span><i class="dot normal"></i>正常</span><span><i class="dot overtime"></i>加班</span><span><i class="dot timeoff"></i>调休</span><span><i class="dot rest"></i>休息日</span></div></div>
         <div class="attendance-layout">
           <section class="surface calendar-panel"><div class="section-head"><div><h2>公司工作日历</h2><p>点击任意日期切换上班/休班；支持任意月份</p></div><strong id="workdays-count"></strong></div><div id="calendar-grid" class="calendar-grid"></div></section>
-          <section class="surface"><div class="section-head"><div><h2>成员考勤</h2><p>默认正常出勤，点击单元格登记加班或调休</p></div></div><div class="scroll-table"><table class="attendance-table"><thead id="attendance-head"></thead><tbody id="attendance-body"></tbody></table></div></section>
+          <section class="surface"><div class="section-head"><div><h2>成员考勤</h2><p>点击日期格登记考勤，左右滑动查看整月</p></div></div><div class="scroll-table"><table class="attendance-table"><thead id="attendance-head"></thead><tbody id="attendance-body"></tbody></table></div></section>
         </div>
         <section class="surface"><div class="section-head"><div><h2 id="summary-title">月度汇总</h2><p id="summary-range">正常、加班、调休天数及异常明细</p></div><select id="summary-period"><option value="week">周汇总</option><option value="month" selected>月汇总</option><option value="year">年汇总</option></select></div><div class="summary-split"><div id="attendance-summary"></div><div id="attendance-details"></div></div></section>
       </section>
@@ -46,23 +49,39 @@
       </section>
       <section id="view-project-records" class="view hidden">
         <div class="toolbar project-toolbar"><div class="toolbar-group"><label for="timeline-start">日期范围</label><input type="date" id="timeline-start" /><span>至</span><input type="date" id="timeline-end" aria-label="结束日期" /></div></div>
-        <section class="surface timeline-section"><div class="section-head"><div><h2>每日总结</h2><p>按进程表时间范围查看每日总结，点击方框可生成、查看或修改</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
+        <section class="surface timeline-section"><div class="section-head"><div><h2>每日总结</h2><p>左右滑动查看日期，点击方框生成、查看或修改总结</p></div></div><div id="summary-timeline" class="timeline-wrap"></div></section>
         <div class="toolbar project-toolbar"><div class="toolbar-group status-checkboxes" id="record-status-filter"><span>状态</span><label><input type="checkbox" value="准备" checked />准备</label><label><input type="checkbox" value="进行" checked />进行</label><label><input type="checkbox" value="维护" checked />维护</label><label><input type="checkbox" value="暂停" checked />暂停</label><label><input type="checkbox" value="结束" />结束</label><input id="record-search" placeholder="搜索项目名称、ID或进展" /></div></div>
-        <section class="surface timeline-section progress-panel"><div class="section-head"><div><h2>项目进程</h2><p>按日期查看工作记录，点击可关联任务与配置完成状态</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
+        <section class="surface timeline-section progress-panel"><div class="section-head"><div><h2>项目进程</h2><p>左右滑动查看日期，点击记录可关联任务与配置完成状态</p></div></div><div id="timeline" class="timeline-wrap"></div></section>
       </section>
       <section id="view-project-detail" class="view hidden"><div id="project-detail-content"></div></section>
-      <section id="view-todos" class="view hidden">
-        <div class="todo-notice" id="todo-push-notice" role="status"></div>
-        <div class="toolbar todo-toolbar">
-          <div class="search-wrap"><input id="todo-search" placeholder="搜索待办内容或项目" aria-label="搜索待办" /></div>
-          <div class="toolbar-group">
-            <select id="todo-project-filter" aria-label="按所属项目筛选"><option value="">全部项目</option></select>
+      <section id="view-models" class="view hidden">
+        <form id="model-form" class="surface settings-panel">
+          <h2>大模型连接</h2><p class="muted-note">支持 OpenAI 兼容的 Chat Completions 服务。基础地址通常以 /v1 结尾，请按服务商文档填写；系统自动追加 /chat/completions。</p>
+          <div class="form-grid">
+            <label class="field full"><span>API 基础地址</span><input name="ai_base_url" type="url" required placeholder="https://api.example.com/v1" /></label>
+            <label class="field"><span>模型名称</span><input name="ai_model" placeholder="填写服务商提供的模型 ID" /></label>
+            <label class="field"><span>请求超时（秒）</span><input name="ai_timeout" type="number" min="10" max="600" required /></label>
+            <label class="field full"><span>API 密钥</span><input name="ai_api_key" type="text" autocomplete="off" spellcheck="false" /><small id="key-status"></small></label>
+            <div class="field full">
+              <div class="model-discovery"><button class="secondary" type="button" id="fetch-models">获取模型列表</button><select id="available-models" aria-label="选择可用模型" disabled><option value="">获取后选择模型</option></select><button type="button" class="primary" id="add-model" disabled>添加并使用</button></div>
+              <small id="models-status" role="status">使用当前填写的地址和密钥获取，无需先保存。选择后点击“保存设置”生效；也可手动填写模型名称。</small>
+            </div>
+            <div class="field full"><span>已添加的模型</span><div id="saved-models" class="saved-models"></div></div>
+            <div class="field full"><label for="prompt-template">写作模板</label><div class="settings-actions"><select id="prompt-template"><option value="">选择模板</option></select><button type="button" class="secondary" id="apply-prompt-template">填入提示词</button></div><small>填入后可继续编辑，点击“保存模型配置”生效。生成时可单独选择周报及七天资料范围。</small></div><label class="field full"><span>汇报提示词（控制语气、格式和篇幅）</span><textarea name="ai_summary_prompt" rows="6"></textarea></label>
           </div>
-        </div>
-        <section class="surface table-surface">
-          <table class="todo-table"><thead><tr><th>待办内容</th><th>所属项目</th><th>定时推送</th><th>操作</th></tr></thead><tbody id="todos-body"></tbody></table>
-          <div id="todos-empty" class="empty hidden">暂无待办，点击右上角新增</div>
-        </section>
+          <div class="settings-actions"><button class="primary" type="submit">保存模型配置</button><button class="secondary" type="button" id="test-model">诊断文本生成</button></div>
+          <p class="muted-note">下方诊断使用已保存配置，文本测试不使用汇报提示词。获取模型列表成功不代表文本生成一定可用。</p><div class="settings-actions"><button type="button" class="secondary" id="diagnose-models">诊断模型列表</button><button type="button" class="secondary" id="copy-diagnostics" disabled>复制脱敏诊断</button></div><div id="model-test-result" role="status"></div>
+          <p class="muted-note">数据库、模型配置与迁移备份保存在外挂数据目录。更换容器时继续挂载同一目录即可保留数据。</p>
+        </form>
+      </section>
+      <section id="view-settings" class="view hidden">
+        <form id="settings-form" class="surface settings-panel"><h2>系统偏好</h2><p class="muted-note">调整界面和日历显示，保存后立即生效。</p><div class="form-grid">            <label class="field"><span>界面色调</span><select name="ui_color_theme"><option value="forest">森林绿</option><option value="ocean">海湾蓝</option><option value="violet">鸢尾紫</option><option value="amber">暖琥珀</option></select></label>
+            <label class="field"><span>每周起始日</span><select name="week_start"><option value="monday">周一</option><option value="sunday">周日</option></select></label>
+</div><div class="settings-actions"><button type="submit" class="primary">保存系统配置</button></div><p class="muted-note">数据持续保存在外挂目录。更新容器时继续使用原数据挂载即可。</p></form>
+      </section>
+      <section id="view-todos" class="view hidden">
+        <div class="toolbar todo-filters"><input id="todo-search" type="search" placeholder="搜索待办内容或项目" aria-label="搜索待办" /><select id="todo-project-filter" aria-label="筛选待办项目"><option value="">全部项目</option><option value="none">未关联项目</option></select><select id="todo-status-filter" aria-label="筛选待办状态"><option value="">全部状态</option><option value="未完成">未完成</option><option value="已完成">已完成</option></select><button type="button" class="text-action" id="todo-reset">重置筛选</button></div>
+        <p id="todo-count" class="muted-note" role="status"></p><div id="todo-list" class="todo-list"></div>
       </section>
     </main>
   </div>

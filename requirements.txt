@@ -1,0 +1,2 @@
+aiohttp==3.12.15
+chinesecalendar==1.11.0

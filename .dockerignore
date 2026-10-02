@@ -1,0 +1,10 @@
+.git
+data
+dist
+tests
+design
+scripts
+__pycache__
+**/__pycache__
+*.sqlite3*
+.env
